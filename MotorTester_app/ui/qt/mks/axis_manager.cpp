@@ -2,12 +2,8 @@
 
 #include "mks/port/can_port_interface.h"
 #include "mks/port/gs_usb_can_port.h"
-#include "mks/adapter/mks_axis_adapter.h"
 #include "mks/protocol/mks_protocol.h"
-#include "mks/adapter/mks_runtime_config.h"
-#include "mks/adapter/mks_runtime_factory.h"
 #include "mks/port/sim_can_port.h"
-#include "ethercat/manager/ethercat_runtime_factory.h"
 #include "motion_core/config/hal_runtime_config_json.h"
 #include "motion_core/config/axis_config_json.h"
 
@@ -87,13 +83,8 @@ AxisManager::AxisManager(QObject* parent) : QObject(parent) {
     slow_timer_ = new QTimer(this);
     slow_timer_->setInterval(1000); // 1 Hz
     connect(slow_timer_, &QTimer::timeout, this, [this]() {
-        if (active_transport_ == ActiveTransport::Mks && !runtime_bus_managers_.empty()) {
-            auto stats = runtime_bus_managers_.front()->get_bus_statistics();
-            emit busStatisticsUpdated(stats.cycle_rate_hz, stats.bus_load_percent);
-        } else if (active_transport_ == ActiveTransport::Ethercat && runtime_ethercat_bus_manager_) {
-            auto stats = runtime_ethercat_bus_manager_->get_bus_statistics();
-            emit busStatisticsUpdated(stats.cycle_rate_hz, stats.bus_load_percent);
-        }
+        // Bus stats currently unsupported through uniform interface
+        // emit busStatisticsUpdated(stats.cycle_rate_hz, stats.bus_load_percent);
     });
 }
 
@@ -111,140 +102,14 @@ bool AxisManager::isReady() const {
     return control_service_ != nullptr;
 }
 
-void AxisManager::applySafetyBaselineForAxis(const int axis_id,
-                                             const QString& reason,
-                                             const bool force_disable) {
-    if (!control_service_) {
-        return;
-    }
-
-    motion_core::SafetyBaselineOptions options{};
-    options.force_disable = force_disable;
-    options.sync_target_to_actual = true;
-
-    const auto result = control_service_->apply_safe_baseline(
-        motion_core::AxisId{static_cast<std::uint16_t>(axis_id)}, options);
-
-    emit logMessage(QString("Axis %1 safety baseline (%2, force_disable=%3) -> %4")
-                        .arg(axis_id)
-                        .arg(reason)
-                        .arg(force_disable ? 1 : 0)
-                        .arg(result.ok() ? "OK" : result.error().message));
-}
-
 void AxisManager::reset_runtime_state() {
     runtime_started_axes_.clear();
     runtime_known_axes_.clear();
 
     if (control_service_) {
-        const auto listed = control_service_->list_axes();
-        if (listed.ok()) {
-            for (const auto& axis_info : listed.value()) {
-                (void)control_service_->stop_axis(axis_info.id);
-                (void)control_service_->remove_axis(axis_info.id);
-            }
-        }
-        (void)control_service_->stop_dispatch_loop();
+        (void)control_service_->close_runtime();
     }
-
-    for (const auto& bus_manager : runtime_bus_managers_) {
-        if (bus_manager) {
-            (void)bus_manager->stop();
-        }
-    }
-    runtime_bus_managers_.clear();
-
-    if (runtime_ethercat_bus_manager_) {
-        (void)runtime_ethercat_bus_manager_->stop_runtime();
-        (void)runtime_ethercat_bus_manager_->close();
-        runtime_ethercat_bus_manager_.reset();
-    }
-
     control_service_.reset();
-}
-
-motion_core::Result<void> AxisManager::rebuild_ethercat_runtime_for_discovered_axes(
-    const std::vector<std::uint16_t>& axis_ids,
-    const std::shared_ptr<ethercat_driver::EthercatBusManager>& existing_bus_manager) {
-    if (opened_device_path_.isEmpty()) {
-        return motion_core::Result<void>::failure(
-            {motion_core::ErrorCode::InvalidArgument, "no opened EtherCAT interface"});
-    }
-    if (axis_ids.empty()) {
-        return motion_core::Result<void>::failure(
-            {motion_core::ErrorCode::NotFound, "no EtherCAT axes discovered"});
-    }
-
-    stopRuntime();
-
-    std::vector<ethercat_driver::EthercatAxisRuntimeConfig> axes_cfg;
-    axes_cfg.reserve(axis_ids.size());
-
-    for (const auto axis_id : axis_ids) {
-        ethercat_driver::EthercatAxisRuntimeConfig acfg{};
-        acfg.axis_id = motion_core::AxisId{axis_id};
-        acfg.axis_name.value = "ECAT " + std::to_string(axis_id);
-        axes_cfg.push_back(std::move(acfg));
-    }
-
-    motion_core::Result<ethercat_driver::EthercatRuntimeBuildResult> built =
-        existing_bus_manager
-            ? ethercat_driver::build_ethercat_runtime_on_existing_bus(existing_bus_manager, axes_cfg)
-            : [&]() {
-                  ethercat_driver::EthercatRuntimeConfig cfg{};
-                  cfg.bus.interface_name = opened_device_path_.toStdString();
-                  cfg.axes = axes_cfg;
-                  return ethercat_driver::build_ethercat_runtime(cfg);
-              }();
-    if (!built.ok()) {
-        return motion_core::Result<void>::failure(built.error());
-    }
-
-    reset_runtime_state();
-
-    control_service_ = std::make_unique<motion_core::AxisControlService>();
-    runtime_ethercat_bus_manager_ = built.value().bus_manager;
-
-    for (const auto& axis : built.value().axes) {
-        const auto reg = control_service_->add_axis(axis);
-        if (!reg.ok()) {
-            reset_runtime_state();
-            return motion_core::Result<void>::failure(reg.error());
-        }
-
-        const auto axis_info = axis->info();
-        runtime_known_axes_.insert(static_cast<int>(axis_info.id.value));
-    }
-
-    // After discovering axes, we might need to apply their configs if we had any
-    // For now, just start what we have
-    return startRuntimeHeadless();
-}
-
-motion_core::Result<void> AxisManager::startRuntimeHeadless() {
-    if (!control_service_) {
-        return motion_core::Result<void>::failure(
-            {motion_core::ErrorCode::NotConnected, "control service is not attached"});
-    }
-
-    const auto start_result = control_service_->start_runtime();
-    if (!start_result.ok()) {
-        return start_result;
-    }
-
-    for (const int axis_id : runtime_known_axes_) {
-        runtime_started_axes_.insert(axis_id);
-        applySafetyBaselineForAxis(axis_id, "startRuntimeHeadless", true);
-    }
-
-    watched_axes_.clear();
-    rr_index_ = 0;
-    if (!runtime_started_axes_.isEmpty()) {
-        fast_timer_->start();
-        slow_timer_->start();
-    }
-
-    return motion_core::Result<void>::success();
 }
 
 motion_core::Result<std::vector<std::uint16_t>> AxisManager::discover_axes(const QString& device_path,
@@ -321,105 +186,6 @@ motion_core::Result<std::vector<std::uint16_t>> AxisManager::discover_axes(const
     return motion_core::Result<std::vector<std::uint16_t>>::success(std::move(found));
 }
 
-motion_core::Result<void> AxisManager::rebuild_runtime_for_discovered_axes(
-    const std::vector<std::uint16_t>& can_ids) {
-    if (opened_device_path_.isEmpty()) {
-        return motion_core::Result<void>::failure(
-            {motion_core::ErrorCode::InvalidArgument, "no opened device path"});
-    }
-    if (opened_baud_rate_ <= 0) {
-        return motion_core::Result<void>::failure(
-            {motion_core::ErrorCode::InvalidArgument, "invalid opened baud rate"});
-    }
-    if (can_ids.empty()) {
-        return motion_core::Result<void>::failure(
-            {motion_core::ErrorCode::NotFound, "no motors discovered"});
-    }
-
-    stopRuntime();
-
-    MksRuntimeConfig cfg{};
-    MksBusRuntimeConfig bus_cfg{};
-    bus_cfg.interface_id = opened_device_path_.toStdString();
-    bus_cfg.device_path = opened_device_path_.toStdString();
-    bus_cfg.baud_rate = static_cast<unsigned int>(opened_baud_rate_);
-    bus_cfg.cycle_time_ms = 4;
-
-    for (const auto can_id : can_ids) {
-        const MksAxisRuntimeConfig default_axis_cfg{};
-        MksAxisRuntimeConfig acfg{};
-        acfg.axis_id = motion_core::AxisId{can_id};
-        acfg.can_id = can_id;
-        acfg.axis_name.value = "Axis " + std::to_string(can_id);
-        acfg.axis_units_per_degree = default_axis_cfg.axis_units_per_degree;
-        acfg.default_speed = default_axis_cfg.default_speed;
-        acfg.default_accel = default_axis_cfg.default_accel;
-        bus_cfg.axes.push_back(acfg);
-    }
-    cfg.buses.push_back(std::move(bus_cfg));
-
-    // On real hardware ensure response mode is ON before runtime starts.
-    if (!opened_device_path_.startsWith("sim", Qt::CaseInsensitive)) {
-        std::unique_ptr<ICanPort> can_port = std::make_unique<GsUsbCanPort>();
-        if (can_port->open(opened_device_path_.toStdString().c_str(), static_cast<unsigned int>(opened_baud_rate_))) {
-            MksProtocol protocol(*can_port);
-            for (const auto can_id : can_ids) {
-                std::vector<std::uint8_t> dummy;
-                (void)protocol.sendCommand(can_id,
-                                           MksCommand::SetSlaveRespondActive,
-                                           {1, 1},
-                                           dummy,
-                                           0xFF,
-                                           0,
-                                           false);
-            }
-            can_port->close();
-        }
-    }
-
-    const auto built = build_mks_runtime(cfg);
-    if (!built.ok()) {
-        return motion_core::Result<void>::failure(built.error());
-    }
-
-    reset_runtime_state();
-
-    control_service_ = std::make_unique<motion_core::AxisControlService>();
-    runtime_bus_managers_ = built.value().bus_managers;
-
-    for (const auto& axis : built.value().axes) {
-        const auto reg = control_service_->add_axis(axis);
-        if (!reg.ok()) {
-            reset_runtime_state();
-            return motion_core::Result<void>::failure(reg.error());
-        }
-
-        const auto axis_info = axis->info();
-        runtime_known_axes_.insert(static_cast<int>(axis_info.id.value));
-    }
-
-    (void)control_service_->start_dispatch_loop(std::chrono::milliseconds{4});
-
-    for (const int axis_id : runtime_known_axes_) {
-        const auto start_res = control_service_->start_axis(motion_core::AxisId{static_cast<std::uint16_t>(axis_id)});
-        if (!start_res.ok()) {
-            emit logMessage(QString("Runtime start axis %1 failed: %2").arg(axis_id).arg(start_res.error().message));
-            continue;
-        }
-        runtime_started_axes_.insert(axis_id);
-        applySafetyBaselineForAxis(axis_id, "rebuild_runtime", true);
-    }
-
-    watched_axes_.clear();
-    rr_index_ = 0;
-    if (!runtime_started_axes_.isEmpty()) {
-        fast_timer_->start();
-        slow_timer_->start();
-    }
-
-    return motion_core::Result<void>::success();
-}
-
 void AxisManager::openDevice(const QString& device_path, int baud_rate) {
     closeDevice();
 
@@ -453,7 +219,6 @@ void AxisManager::openDevice(const QString& device_path, int baud_rate) {
     opened_device_path_ = device_path;
     opened_baud_rate_ = baud_rate;
     device_opened_ = true;
-    active_transport_ = ActiveTransport::Mks;
 
     emit logMessage(QString("Device opened: %1 @ %2. Use Scan to discover real motors.")
                         .arg(device_path)
@@ -479,7 +244,6 @@ void AxisManager::openEthercatDevice(const QString& interface_name) {
     opened_device_path_ = interface_name;
     opened_baud_rate_ = 0;
     device_opened_ = true;
-    active_transport_ = ActiveTransport::Ethercat;
 
     emit logMessage(QString("EtherCAT interface opened: %1. Use Scan to discover slaves.")
                         .arg(interface_name));
@@ -504,7 +268,6 @@ void AxisManager::closeDevice() {
     opened_device_path_.clear();
     opened_baud_rate_ = 0;
     device_opened_ = false;
-    active_transport_ = ActiveTransport::None;
 
     emit connectionChanged(false);
     emit logMessage("Device/runtime closed");
@@ -564,11 +327,21 @@ void AxisManager::startRuntime() {
         return;
     }
 
-    const auto start_result = startRuntimeHeadless();
+    const auto start_result = control_service_->start_runtime();
     if (!start_result.ok()) {
         emit logMessage(QString("Runtime start failed: %1").arg(start_result.error().message));
         emit connectionChanged(false);
         return;
+    }
+
+    for (const int axis_id : runtime_known_axes_) {
+        runtime_started_axes_.insert(axis_id);
+    }
+    watched_axes_.clear();
+    rr_index_ = 0;
+    if (!runtime_started_axes_.isEmpty()) {
+        fast_timer_->start();
+        slow_timer_->start();
     }
 
     emit connectionChanged(!runtime_started_axes_.isEmpty());
@@ -589,12 +362,6 @@ void AxisManager::stopRuntime() {
 }
 
 void AxisManager::scanMotors(int max_id) {
-    if (active_transport_ == ActiveTransport::Ethercat) {
-        Q_UNUSED(max_id);
-        scanEthercatMotors();
-        return;
-    }
-
     if (!device_opened_) {
         emit logMessage("Scan failed: open device first");
         emit scanFinished({});
@@ -604,7 +371,7 @@ void AxisManager::scanMotors(int max_id) {
 
     // If a runtime is currently active from a previous scan/start, release its CAN handle
     // before opening a temporary port for discovery.
-    if (!runtime_bus_managers_.empty() || control_service_) {
+    if (control_service_) {
         if (fast_timer_) {
             fast_timer_->stop();
         }
@@ -634,12 +401,59 @@ void AxisManager::scanMotors(int max_id) {
         return;
     }
 
-    const auto rebuild = rebuild_runtime_for_discovered_axes(discovered.value());
-    if (!rebuild.ok()) {
-        emit logMessage(QString("Runtime rebuild failed after scan: %1").arg(rebuild.error().message));
+    motion_core::HalRuntimeConfig hal_cfg{};
+    motion_core::HalBusConfigMks bus_cfg{};
+    bus_cfg.interface_id = opened_device_path_.toStdString();
+    bus_cfg.device_path = opened_device_path_.toStdString();
+    bus_cfg.baud_rate = static_cast<uint32_t>(opened_baud_rate_);
+    hal_cfg.mks_buses.push_back(std::move(bus_cfg));
+
+    for (const auto can_id : discovered.value()) {
+        motion_core::HalAxisRuntimeEntry acfg{};
+        acfg.axis_id = motion_core::AxisId{can_id};
+        acfg.axis_name.value = "Axis " + std::to_string(can_id);
+        acfg.transport = motion_core::AxisTransportKind::MksCan;
+        acfg.bus_ref = opened_device_path_.toStdString();
+        acfg.transport_address = can_id;
+        hal_cfg.axes.push_back(std::move(acfg));
+    }
+
+    if (!control_service_) {
+        control_service_ = std::make_unique<motion_core::AxisControlService>();
+    }
+
+    const auto open_res = control_service_->open_runtime(hal_cfg);
+    if (!open_res.ok()) {
+        emit logMessage(QString("Runtime rebuild failed after scan: %1").arg(open_res.error().message));
         emit scanFinished({});
         emit connectionChanged(false);
         return;
+    }
+
+    const auto listed = control_service_->list_axes();
+    if (listed.ok()) {
+        for (const auto& axis_info : listed.value()) {
+            runtime_known_axes_.insert(static_cast<int>(axis_info.id.value));
+        }
+    }
+
+    // Call start immediately like the old rebuild did
+    const auto start_res = control_service_->start_runtime();
+    if (!start_res.ok()) {
+        emit logMessage(QString("Runtime start failed: %1").arg(start_res.error().message));
+        emit scanFinished({});
+        emit connectionChanged(false);
+        return;
+    }
+
+    for (const int axis_id : runtime_known_axes_) {
+        runtime_started_axes_.insert(axis_id);
+    }
+    watched_axes_.clear();
+    rr_index_ = 0;
+    if (!runtime_started_axes_.isEmpty()) {
+        fast_timer_->start();
+        slow_timer_->start();
     }
 
     QVariantList out;
@@ -656,14 +470,14 @@ void AxisManager::scanMotors(int max_id) {
 }
 
 void AxisManager::scanEthercatMotors() {
-    if (active_transport_ != ActiveTransport::Ethercat || !device_opened_) {
+    if (!device_opened_) {
         emit logMessage("EtherCAT scan failed: open EtherCAT interface first");
         emit ethercatScanFinished({});
         emit connectionChanged(false);
         return;
     }
 
-    if (runtime_ethercat_bus_manager_ || control_service_) {
+    if (control_service_) {
         if (fast_timer_) {
             fast_timer_->stop();
         }
@@ -705,13 +519,58 @@ void AxisManager::scanEthercatMotors() {
         return;
     }
 
-    const auto rebuild = rebuild_ethercat_runtime_for_discovered_axes(discovered.value(), probe_bus);
-    if (!rebuild.ok()) {
-        (void)probe_bus->close();
-        emit logMessage(QString("EtherCAT runtime rebuild failed after scan: %1").arg(rebuild.error().message));
+    (void)probe_bus->close();
+
+    motion_core::HalRuntimeConfig hal_cfg{};
+    motion_core::HalBusConfigEthercat ecat_cfg{};
+    ecat_cfg.interface_name = opened_device_path_.toStdString();
+    hal_cfg.ethercat_buses.push_back(std::move(ecat_cfg));
+
+    for (const auto can_id : discovered.value()) {
+        motion_core::HalAxisRuntimeEntry acfg{};
+        acfg.axis_id = motion_core::AxisId{can_id};
+        acfg.axis_name.value = "ECAT " + std::to_string(can_id);
+        acfg.transport = motion_core::AxisTransportKind::Ethercat;
+        acfg.bus_ref = opened_device_path_.toStdString();
+        acfg.transport_address = can_id;
+        hal_cfg.axes.push_back(std::move(acfg));
+    }
+
+    if (!control_service_) {
+        control_service_ = std::make_unique<motion_core::AxisControlService>();
+    }
+
+    const auto open_res = control_service_->open_runtime(hal_cfg);
+    if (!open_res.ok()) {
+        emit logMessage(QString("EtherCAT runtime rebuild failed after scan: %1").arg(open_res.error().message));
         emit ethercatScanFinished({});
         emit connectionChanged(false);
         return;
+    }
+
+    const auto listed = control_service_->list_axes();
+    if (listed.ok()) {
+        for (const auto& axis_info : listed.value()) {
+            runtime_known_axes_.insert(static_cast<int>(axis_info.id.value));
+        }
+    }
+
+    const auto start_res = control_service_->start_runtime();
+    if (!start_res.ok()) {
+        emit logMessage(QString("EtherCAT runtime start failed: %1").arg(start_res.error().message));
+        emit ethercatScanFinished({});
+        emit connectionChanged(false);
+        return;
+    }
+
+    for (const int axis_id : runtime_known_axes_) {
+        runtime_started_axes_.insert(axis_id);
+    }
+    watched_axes_.clear();
+    rr_index_ = 0;
+    if (!runtime_started_axes_.isEmpty()) {
+        fast_timer_->start();
+        slow_timer_->start();
     }
 
     QVariantList out;
@@ -779,46 +638,18 @@ void AxisManager::clearErrors(int axis_id) {
                         .arg(axis_id)
                         .arg(result.ok() ? "OK" : result.error().message));
     if (result.ok()) {
-        applySafetyBaselineForAxis(axis_id, "clear_errors", false);
+        motion_core::SafetyBaselineOptions options{};
+        options.force_disable = false;
+        options.sync_target_to_actual = true;
+        (void)control_service_->apply_safe_baseline(motion_core::AxisId{static_cast<std::uint16_t>(axis_id)}, options);
     }
 }
 
 void AxisManager::sendRawCommand(int axis_id, quint8 cmd, const QByteArray& data) {
-    if (active_transport_ == ActiveTransport::Ethercat) {
-        emit logMessage("Raw CAN command is not supported for EtherCAT transport");
-        Q_UNUSED(axis_id);
-        Q_UNUSED(cmd);
-        Q_UNUSED(data);
-        return;
-    }
-
-    if (runtime_bus_managers_.empty()) {
-        emit logMessage("Failed to send raw command: no bus managers attached");
-        return;
-    }
-
-    std::vector<std::uint8_t> payload(data.begin(), data.end());
-
-    // Try sending it via every bus manager (usually there will only be one).
-    // The bus manager will reject it if it doesn't own that axis_id.
-    bool sent = false;
-    for (const auto& bus : runtime_bus_managers_) {
-        const auto result = bus->send_raw_command(static_cast<std::uint16_t>(axis_id), cmd, payload);
-        if (result.ok()) {
-            sent = true;
-            break;
-        }
-    }
-
-    if (!sent) {
-        emit logMessage(QString("Axis %1 send raw command (0x%2) -> Failed (Not Found or Error)")
-                            .arg(axis_id)
-                            .arg(cmd, 2, 16, QChar('0')));
-    } else {
-        emit logMessage(QString("Axis %1 send raw command (0x%2) -> Dispatched")
-                            .arg(axis_id)
-                            .arg(cmd, 2, 16, QChar('0')));
-    }
+    Q_UNUSED(axis_id);
+    Q_UNUSED(cmd);
+    Q_UNUSED(data);
+    emit logMessage("Raw command sending is deprecated in the headless target API. Configuration should be applied via AxisConfig/Parameter patching.");
 }
 
 void AxisManager::moveAbsoluteAxis(int axis_id, int speed, int accel, double axis_deg) {
@@ -1113,7 +944,10 @@ void AxisManager::applyParameterPatch(int axis_id, const QVariantList& patch_ent
         emit logMessage(QString("Axis %1 applied patch with %2 entries")
                             .arg(axis_id)
                             .arg(patch.entries.size()));
-        applySafetyBaselineForAxis(axis_id, "apply_parameter_patch", false);
+        motion_core::SafetyBaselineOptions options{};
+        options.force_disable = false;
+        options.sync_target_to_actual = true;
+        (void)control_service_->apply_safe_baseline(motion_core::AxisId{static_cast<std::uint16_t>(axis_id)}, options);
     }
 }
 
@@ -1158,7 +992,10 @@ void AxisManager::importAxisConfig(int axis_id, const QString& path) {
                             .arg(apply_res.error().message));
     } else {
         emit logMessage(QString("Axis %1 config imported from %2").arg(axis_id).arg(path));
-        applySafetyBaselineForAxis(axis_id, "import_axis_config", false);
+        motion_core::SafetyBaselineOptions options{};
+        options.force_disable = false;
+        options.sync_target_to_actual = true;
+        (void)control_service_->apply_safe_baseline(motion_core::AxisId{static_cast<std::uint16_t>(axis_id)}, options);
     }
 }
 
