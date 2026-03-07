@@ -8,7 +8,6 @@
 
 #include "motion_core/axis_control_service.h"
 #include "motion_core/result.h"
-#include "ethercat/manager/ethercat_bus_manager.h"
 
 #include <cstdint>
 #include <memory>
@@ -22,7 +21,6 @@ namespace motion_core {
 namespace mks {
 class ICanPort;
 class MksProtocol;
-class MksCanBusManager;
 
 class AxisManager : public QObject {
     Q_OBJECT
@@ -85,35 +83,20 @@ private slots:
     void onFastTick();
 
 private:
-    enum class ActiveTransport {
-        None = 0,
-        Mks,
-        Ethercat,
-    };
-
     bool isReady() const;
-    void applySafetyBaselineForAxis(int axis_id, const QString& reason, bool force_disable = true);
 
     void reset_runtime_state();
-    motion_core::Result<void> startRuntimeHeadless();
     motion_core::Result<std::vector<std::uint16_t>> discover_axes(const QString& device_path,
                                                                   int baud_rate,
                                                                   int max_id) const;
-    motion_core::Result<void> rebuild_runtime_for_discovered_axes(const std::vector<std::uint16_t>& can_ids);
-    motion_core::Result<void> rebuild_ethercat_runtime_for_discovered_axes(
-        const std::vector<std::uint16_t>& axis_ids,
-        const std::shared_ptr<ethercat_driver::EthercatBusManager>& existing_bus_manager = {});
 
     std::unique_ptr<motion_core::AxisControlService> control_service_;
-    std::vector<std::shared_ptr<MksCanBusManager>> runtime_bus_managers_;
-    std::shared_ptr<ethercat_driver::EthercatBusManager> runtime_ethercat_bus_manager_;
     QSet<int> runtime_known_axes_;
     QSet<int> runtime_started_axes_;
     QString runtime_config_path_;
     QString opened_device_path_;
     int opened_baud_rate_{0};
     bool device_opened_{false};
-    ActiveTransport active_transport_{ActiveTransport::None};
 
     QTimer* fast_timer_{nullptr};
     QTimer* slow_timer_{nullptr};

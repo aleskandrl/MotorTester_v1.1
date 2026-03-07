@@ -103,9 +103,33 @@ Result<void> AxisControlService::close_runtime() {
 
 Result<void> AxisControlService::start_runtime() {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& [_, slot] : axes_) {
+    for (auto& [id, slot] : axes_) {
         const auto res = slot.axis->start();
         if (!res.ok()) return res;
+
+        // Apply safety baseline: force disable, sync actual position
+        motion_core::SafetyBaselineOptions options{};
+        options.force_disable = true;
+        options.sync_target_to_actual = true;
+
+        motion_core::AxisCommand baseline_cmd{};
+        baseline_cmd.has_enable_state = true;
+        baseline_cmd.enable_state = !options.force_disable;
+
+        if (options.sync_target_to_actual) {
+            const auto tel_res = slot.axis->read_telemetry();
+            if (tel_res.ok() && tel_res.value().has_actual_position) {
+                baseline_cmd.has_target_position = true;
+                baseline_cmd.target_position_deg = tel_res.value().actual_position_deg;
+                // Pre-fill a safe nominal speed/accel so the axis doesn't jump
+                baseline_cmd.has_profile_speed_rpm = true;
+                baseline_cmd.profile_speed_rpm = 10;
+                baseline_cmd.has_profile_accel_percent = true;
+                baseline_cmd.profile_accel_percent = 5.0;
+            }
+        }
+
+        (void)slot.axis->apply_command(baseline_cmd);
     }
     return start_dispatch_loop();
 }
