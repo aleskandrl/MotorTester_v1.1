@@ -4,6 +4,7 @@
 #include <cmath>
 #include <chrono>
 #include <array>
+#include <cstring>
 
 namespace ethercat_driver {
 
@@ -18,6 +19,7 @@ constexpr uint16_t ObjStatusword          = 0x6041;
 constexpr uint16_t ObjActualPosition      = 0x6064;
 constexpr uint16_t ObjErrorCode           = 0x603F;
 constexpr uint16_t ObjActualTorque        = 0x6077;
+constexpr uint16_t ObjTargetVelocity      = 0x60FF;
 
 constexpr uint16_t CmdShutdown      = 0x0006;
 constexpr uint16_t CmdSwitchOn      = 0x0007;
@@ -38,6 +40,7 @@ constexpr uint16_t ValSwitchOnDisabled  = 0x0040;
 static ec_pdo_entry_info_t dgn_pdo_entries[] = {
     {ObjControlword, 0x00, 16},
     {ObjTargetPosition, 0x00, 32},
+    {ObjTargetVelocity, 0x00, 32},
     {ObjModesOfOperation, 0x00, 8},
     {ObjMaxProfileVelocity, 0x00, 32},
     {ObjStatusword, 0x00, 16},
@@ -47,8 +50,8 @@ static ec_pdo_entry_info_t dgn_pdo_entries[] = {
 };
 
 static ec_pdo_info_t dgn_pdos[] = {
-    {0x1600, 4, dgn_pdo_entries + 0}, 
-    {0x1A00, 4, dgn_pdo_entries + 4}, 
+    {0x1600, 5, dgn_pdo_entries + 0}, 
+    {0x1A00, 4, dgn_pdo_entries + 5}, 
 };
 
 static ec_sync_info_t dgn_syncs[] = {
@@ -101,7 +104,9 @@ motion_core::Result<void> EthercatAxisAdapter::configure_hardware() {
             {motion_core::ErrorCode::TransportFailure, "Failed to configure slave PDOs"});
     }
 
-    std::array<unsigned int, 8> bit_positions{};
+    // One bit-position slot per registered PDO entry below.
+    // Keep the size in sync with the number of domain_regs entries that use bit_positions[i].
+    std::array<unsigned int, 9> bit_positions{};
 
     ec_pdo_entry_reg_t domain_regs[] = {
         {0,
@@ -168,6 +173,14 @@ motion_core::Result<void> EthercatAxisAdapter::configure_hardware() {
          0,
          &off_act_torque_,
          &bit_positions[7]},
+        {0,
+         static_cast<uint16_t>(config_.ecat_bus_position),
+         DVS_VENDOR_ID,
+         DVS_PRODUCT_CODE,
+         ObjTargetVelocity,
+         0,
+         &off_target_vel_,
+         &bit_positions[8]},
         {0, 0, 0, 0, 0, 0, nullptr, nullptr}
     };
 
@@ -177,7 +190,32 @@ motion_core::Result<void> EthercatAxisAdapter::configure_hardware() {
     }
 
     config_.bus_manager->register_adapter(config_.ecat_axis_index, this);
-    
+
+    // Read axial resolution (0x6091:02) — instruction units per motor revolution.
+    // This is the scale for all PDO position objects (0x6064, 0x607A).
+    // Default is 10000. Do NOT use encoder_resolution_bits_ for this.
+    uint32_t axial_res = 0;
+    uint32_t abort_code = 0;
+    size_t result_size = 0;
+    if (ecrt_master_sdo_upload(master, config_.ecat_bus_position,
+                               0x6091, 2,
+                               reinterpret_cast<uint8_t*>(&axial_res), sizeof(axial_res),
+                               &result_size, &abort_code) == 0 && result_size == 4 && axial_res > 0) {
+        counts_per_revolution_.store(axial_res, std::memory_order_release);
+        recalculate_counts_per_radian();
+    }
+
+    uint32_t max_profile_vel = 0;
+    abort_code = 0;
+    result_size = 0;
+    if (ecrt_master_sdo_upload(master, config_.ecat_bus_position,
+                               ObjMaxProfileVelocity, 0,
+                               reinterpret_cast<uint8_t*>(&max_profile_vel), sizeof(max_profile_vel),
+                               &result_size, &abort_code) == 0 && result_size == 4 && max_profile_vel > 0) {
+        max_profile_velocity_instr_s_.store(max_profile_vel, std::memory_order_release);
+        has_max_profile_velocity_instr_s_.store(true, std::memory_order_release);
+    }
+
     return motion_core::Result<void>::success();
 }
 
@@ -228,16 +266,23 @@ motion_core::Result<void> EthercatAxisAdapter::apply_command(const motion_core::
         cmd_.reset_req.store(true, std::memory_order_release);
     }
     if (command.go_home) {
-        return motion_core::Result<void>::failure(
-            {motion_core::ErrorCode::Unsupported, "Homing command is not implemented for EtherCAT adapter"});
+        cmd_.mode_req.store(6, std::memory_order_release);
+        cmd_.homing_req.store(true, std::memory_order_release);
     }
     if (command.set_zero) {
-        return motion_core::Result<void>::failure(
-            {motion_core::ErrorCode::Unsupported, "Set zero is not implemented for EtherCAT adapter"});
+        cmd_.set_zero_req.store(true, std::memory_order_release);
     }
     if (command.has_target_velocity) {
-        return motion_core::Result<void>::failure(
-            {motion_core::ErrorCode::Unsupported, "Velocity command PDO is not implemented for EtherCAT adapter"});
+        cmd_.has_target_vel.store(true, std::memory_order_release);
+        cmd_.target_vel_deg_s.store(command.target_velocity_deg_per_sec, std::memory_order_release);
+    } else {
+        cmd_.has_target_vel.store(false, std::memory_order_release);
+    }
+    if (command.has_profile_speed_rpm) {
+        cmd_.has_profile_vel.store(true, std::memory_order_release);
+        cmd_.profile_vel_rpm.store(command.profile_speed_rpm, std::memory_order_release);
+    } else {
+        cmd_.has_profile_vel.store(false, std::memory_order_release);
     }
     if (command.has_target_position) {
         if (mode_ != motion_core::AxisMode::ProfilePosition &&
@@ -284,24 +329,29 @@ motion_core::Result<motion_core::AxisTelemetry> EthercatAxisAdapter::read_teleme
 
 std::vector<motion_core::ParameterDescriptor> EthercatAxisAdapter::make_parameter_descriptors() {
     std::vector<motion_core::ParameterDescriptor> out;
-    
-    motion_core::ParameterDescriptor enc{};
-    enc.id = motion_core::make_parameter_id(motion_core::CommonParameter::HardwareEncoderResolutionBits);
-    enc.name = "Encoder Resolution (bits)";
-    enc.group = "Common/Hardware";
-    enc.unit = "bits";
-    enc.read_only = false;
-    enc.persistable = true;
-    enc.has_min = true;
-    enc.has_max = true;
-    enc.min_value = motion_core::ParameterValue::from_unsigned(1);
-    enc.max_value = motion_core::ParameterValue::from_unsigned(31);
-    out.push_back(enc);
+    out.reserve(p100e_dictionary.size() + 2);
 
+    // Build descriptors from the authoritative p100e_dictionary.
+    for (const auto& def : p100e_dictionary) {
+        motion_core::ParameterDescriptor d{};
+        d.id = def.id;
+        d.name = def.name;
+        d.group = def.group;
+        d.unit = def.unit;
+        d.read_only = def.is_read_only;
+        d.persistable = def.persistable_runtime;
+        d.has_min = true;
+        d.has_max = true;
+        d.min_value = def.min_value;
+        d.max_value = def.max_value;
+        out.push_back(d);
+    }
+
+    // Gear ratio is a local config parameter, not an SDO in the dictionary.
     motion_core::ParameterDescriptor gear{};
     gear.id = motion_core::make_parameter_id(motion_core::CommonParameter::HardwareGearRatio);
     gear.name = "Gear Ratio";
-    gear.group = "Common/Hardware";
+    gear.group = "Common/Mechanics";
     gear.unit = "motor_turns_per_output_turn";
     gear.read_only = false;
     gear.persistable = true;
@@ -311,45 +361,6 @@ std::vector<motion_core::ParameterDescriptor> EthercatAxisAdapter::make_paramete
     gear.max_value = motion_core::ParameterValue::from_floating(1000.0);
     out.push_back(gear);
 
-    auto add_ecat_pd = [&out](motion_core::EthercatParameter param_id,
-                              const char* name,
-                              const char* group,
-                              const char* unit,
-                              bool read_only,
-                              bool persistable = true) {
-        motion_core::ParameterDescriptor d{};
-        d.id = motion_core::make_parameter_id(param_id);
-        d.name = name;
-        d.group = group;
-        d.unit = unit;
-        d.read_only = read_only;
-        d.persistable = persistable;
-        out.push_back(d);
-    };
-
-    add_ecat_pd(motion_core::EthercatParameter::Controlword, "Controlword", "CiA402", "", false, false);
-    add_ecat_pd(motion_core::EthercatParameter::Statusword, "Statusword", "CiA402", "", true, false);
-    add_ecat_pd(motion_core::EthercatParameter::OperationMode, "Modes of Operation", "CiA402", "", false, true);
-    add_ecat_pd(motion_core::EthercatParameter::ActualPositionCounts, "Actual Position", "CiA402/Telemetry", "counts", true, false);
-    add_ecat_pd(motion_core::EthercatParameter::ActualVelocityCountsPerSec, "Actual Velocity", "CiA402/Telemetry", "counts/s", true, false);
-    add_ecat_pd(motion_core::EthercatParameter::TargetPositionCounts, "Target Position", "CiA402/Telemetry", "counts", true, false);
-    add_ecat_pd(motion_core::EthercatParameter::MaxProfileVelocityCountsPerSec, "Max Profile Velocity", "CiA402/Limits", "counts/s", false, true);
-    add_ecat_pd(motion_core::EthercatParameter::MaxTorqueTenthsPercent, "Max Torque", "CiA402/Limits", "0.1%", false, true);
-    
-    // Limits
-    add_ecat_pd(motion_core::EthercatParameter::SoftLimitMinCounts, "Soft Limit Min", "CiA402/Limits", "counts", false, true);
-    add_ecat_pd(motion_core::EthercatParameter::SoftLimitMaxCounts, "Soft Limit Max", "CiA402/Limits", "counts", false, true);
-
-    // PID - dummy representation for EtherCAT (often these are standard objects depending on the drive)
-    add_ecat_pd(motion_core::EthercatParameter::PidPosKp, "Pos P", "PID/Position", "", false, true);
-    add_ecat_pd(motion_core::EthercatParameter::PidVelKp, "Vel P", "PID/Velocity", "", false, true);
-    add_ecat_pd(motion_core::EthercatParameter::PidVelKi, "Vel I", "PID/Velocity", "", false, true);
-    add_ecat_pd(motion_core::EthercatParameter::PidPosFF, "Pos FF", "PID/Position", "", false, true);
-    add_ecat_pd(motion_core::EthercatParameter::PidCurrentKp, "Current P", "PID/Current", "", false, true);
-    add_ecat_pd(motion_core::EthercatParameter::PidCurrentKi, "Current I", "PID/Current", "", false, true);
-    add_ecat_pd(motion_core::EthercatParameter::PidModelKp, "Model P", "PID/Model", "", false, true);
-    add_ecat_pd(motion_core::EthercatParameter::PidModelKi, "Model I", "PID/Model", "", false, true);
-    
     return out;
 }
 
@@ -363,35 +374,46 @@ motion_core::Result<motion_core::ParameterSet> EthercatAxisAdapter::read_paramet
 
     auto* master = config_.bus_manager->master();
     if (!master) {
-        return motion_core::Result<motion_core::ParameterSet>::failure({motion_core::ErrorCode::NotConnected, "Master not available"});
+        return motion_core::Result<motion_core::ParameterSet>::failure(
+            {motion_core::ErrorCode::NotConnected, "Master not available"});
     }
 
     motion_core::ParameterSet out{};
     uint32_t abort_code = 0;
     size_t result_size = 0;
 
-    auto add_if_persistable = [&out](const motion_core::ParameterId id, motion_core::ParameterValue val) {
-        auto descriptors = make_parameter_descriptors();
-        for (const auto& desc : descriptors) {
-            if (desc.id.domain == id.domain && desc.id.value == id.value && desc.persistable) {
-                out.entries.push_back({id, std::move(val)});
-                return;
-            }
+    // Read all SDO entries from the dictionary.
+    for (const auto& def : p100e_dictionary) {
+        uint8_t buf[8] = {};
+        if (ecrt_master_sdo_upload(master, config_.ecat_bus_position,
+                                   def.index, def.sub_index,
+                                   buf, def.data_size,
+                                   &result_size, &abort_code) != 0) {
+            continue; // skip on SDO error
         }
-    };
 
-    // Read 0x608F:01 (Encoder Resolution)
-    uint32_t enc_res = 0;
-    if (ecrt_master_sdo_upload(master, config_.ecat_bus_position, 0x608F, 1, 
-                               reinterpret_cast<uint8_t*>(&enc_res), sizeof(enc_res), 
-                               &result_size, &abort_code) == 0 && result_size == 4) {
-        
-        add_if_persistable(motion_core::make_parameter_id(motion_core::CommonParameter::HardwareEncoderResolutionBits), 
-                           motion_core::ParameterValue::from_unsigned(enc_res));
-
-        add_if_persistable(motion_core::make_parameter_id(motion_core::CommonParameter::HardwareGearRatio), 
-                           motion_core::ParameterValue::from_floating(gear_ratio_.load(std::memory_order_acquire)));
+        motion_core::ParameterValue val{};
+        if (def.type == motion_core::ParameterValueType::SignedInteger) {
+            int32_t v = 0;
+            if (def.data_size == 1) v = static_cast<int8_t>(buf[0]);
+            else if (def.data_size == 2) { int16_t t; std::memcpy(&t, buf, 2); v = t; }
+            else if (def.data_size == 4) { std::memcpy(&v, buf, 4); }
+            val = motion_core::ParameterValue::from_signed(v);
+        } else {
+            uint32_t v = 0;
+            if (def.data_size == 1) v = buf[0];
+            else if (def.data_size == 2) { uint16_t t; std::memcpy(&t, buf, 2); v = t; }
+            else if (def.data_size == 4) { std::memcpy(&v, buf, 4); }
+            val = motion_core::ParameterValue::from_unsigned(v);
+        }
+        out.entries.push_back({def.id, val});
     }
+
+    // Gear ratio: local config, no SDO.
+    out.entries.push_back({
+        motion_core::make_parameter_id(motion_core::CommonParameter::HardwareGearRatio),
+        motion_core::ParameterValue::from_floating(gear_ratio_.load(std::memory_order_acquire))
+    });
 
     return motion_core::Result<motion_core::ParameterSet>::success(std::move(out));
 }
@@ -402,40 +424,81 @@ motion_core::Result<void> EthercatAxisAdapter::apply_parameter_patch(const motio
 
     auto* master = config_.bus_manager->master();
     if (!master) {
-        return motion_core::Result<void>::failure({motion_core::ErrorCode::NotConnected, "Master not available"});
+        return motion_core::Result<void>::failure(
+            {motion_core::ErrorCode::NotConnected, "Master not available"});
     }
 
     for (const auto& entry : patch.entries) {
-        if (entry.id.domain != motion_core::ParameterDomain::Common) {
-            continue;
-        }
-
-        const auto common = static_cast<motion_core::CommonParameter>(entry.id.value);
-        if (common == motion_core::CommonParameter::HardwareEncoderResolutionBits) {
-            if (entry.value.type == motion_core::ParameterValueType::UnsignedInteger &&
-                entry.value.unsigned_value >= 1U &&
-                entry.value.unsigned_value <= 31U) {
-                encoder_resolution_bits_.store(
-                    static_cast<std::uint32_t>(entry.value.unsigned_value),
-                    std::memory_order_release);
-                recalculate_counts_per_radian();
+        if (entry.id.domain == motion_core::ParameterDomain::Common) {
+            const auto common = static_cast<motion_core::CommonParameter>(entry.id.value);
+            if (common == motion_core::CommonParameter::HardwareGearRatio) {
+                double ratio = 0.0;
+                if (entry.value.type == motion_core::ParameterValueType::FloatingPoint)
+                    ratio = entry.value.floating_value;
+                else if (entry.value.type == motion_core::ParameterValueType::UnsignedInteger)
+                    ratio = static_cast<double>(entry.value.unsigned_value);
+                else if (entry.value.type == motion_core::ParameterValueType::SignedInteger)
+                    ratio = static_cast<double>(entry.value.signed_value);
+                if (ratio > 0.0 && std::isfinite(ratio)) {
+                    gear_ratio_.store(ratio, std::memory_order_release);
+                    recalculate_counts_per_radian();
+                }
             }
             continue;
         }
 
-        if (common == motion_core::CommonParameter::HardwareGearRatio) {
-            double ratio = 0.0;
-            if (entry.value.type == motion_core::ParameterValueType::FloatingPoint) {
-                ratio = entry.value.floating_value;
-            } else if (entry.value.type == motion_core::ParameterValueType::UnsignedInteger) {
-                ratio = static_cast<double>(entry.value.unsigned_value);
-            } else if (entry.value.type == motion_core::ParameterValueType::SignedInteger) {
-                ratio = static_cast<double>(entry.value.signed_value);
-            }
+        if (entry.id.domain != motion_core::ParameterDomain::Ethercat) {
+            continue;
+        }
 
-            if (ratio > 0.0 && std::isfinite(ratio)) {
-                gear_ratio_.store(ratio, std::memory_order_release);
+        // Find the SDO address in the dictionary.
+        const ParameterDefinition* def = nullptr;
+        for (const auto& d : p100e_dictionary) {
+            if (d.id.domain == entry.id.domain && d.id.value == entry.id.value) {
+                def = &d;
+                break;
+            }
+        }
+        if (!def || def->is_read_only) continue;
+
+        // Marshal value into little-endian bytes.
+        uint8_t buf[4] = {};
+        if (def->type == motion_core::ParameterValueType::SignedInteger) {
+            int32_t v = (entry.value.type == motion_core::ParameterValueType::SignedInteger)
+                            ? static_cast<int32_t>(entry.value.signed_value)
+                            : static_cast<int32_t>(entry.value.unsigned_value);
+            std::memcpy(buf, &v, def->data_size);
+        } else {
+            uint32_t v = (entry.value.type == motion_core::ParameterValueType::UnsignedInteger)
+                             ? static_cast<uint32_t>(entry.value.unsigned_value)
+                             : static_cast<uint32_t>(entry.value.signed_value);
+            std::memcpy(buf, &v, def->data_size);
+        }
+
+        uint32_t abort_code = 0;
+        if (ecrt_master_sdo_download(master, config_.ecat_bus_position,
+                                     def->index, def->sub_index,
+                                     buf, def->data_size, &abort_code) != 0 || abort_code != 0) {
+            return motion_core::Result<void>::failure(
+                {motion_core::ErrorCode::TransportFailure, "SDO download failed for EtherCAT parameter patch"});
+        }
+
+        // If this was AxialResolution, update local scale.
+        if (entry.id.value == static_cast<uint32_t>(motion_core::EthercatParameter::AxialResolution)) {
+            uint32_t new_res = 0;
+            std::memcpy(&new_res, buf, 4);
+            if (new_res > 0) {
+                counts_per_revolution_.store(new_res, std::memory_order_release);
                 recalculate_counts_per_radian();
+            }
+        }
+
+        if (entry.id.value == static_cast<uint32_t>(motion_core::EthercatParameter::MaxProfileVelocityCountsPerSec)) {
+            uint32_t max_profile_vel = 0;
+            std::memcpy(&max_profile_vel, buf, 4);
+            if (max_profile_vel > 0) {
+                max_profile_velocity_instr_s_.store(max_profile_vel, std::memory_order_release);
+                has_max_profile_velocity_instr_s_.store(true, std::memory_order_release);
             }
         }
     }
@@ -443,7 +506,7 @@ motion_core::Result<void> EthercatAxisAdapter::apply_parameter_patch(const motio
     return motion_core::Result<void>::success();
 }
 
-void EthercatAxisAdapter::process_cycle(uint8_t* domain_pd) {
+void EthercatAxisAdapter::process_cycle(uint8_t* domain_pd, double dt_s) {
     if (!domain_pd) return;
 
     // --- Read Process Data ---
@@ -466,11 +529,25 @@ void EthercatAxisAdapter::process_cycle(uint8_t* domain_pd) {
         is_ready = true;
     }
 
+    if (cmd_.set_zero_req.exchange(false, std::memory_order_relaxed)) {
+        zero_offset_counts_.store(act_pos_counts, std::memory_order_release);
+        cmd_.target_pos_deg.store(0.0, std::memory_order_release);
+        cmd_.target_pos_counts.store(act_pos_counts, std::memory_order_release);
+    }
+
     const auto zero_offset_counts = zero_offset_counts_.load(std::memory_order_acquire);
     const auto counts_per_radian = counts_per_radian_.load(std::memory_order_acquire);
 
     double pos_rad = static_cast<double>(act_pos_counts - zero_offset_counts) / counts_per_radian;
     double pos_deg = pos_rad * (180.0 / M_PI);
+
+    // Calc velocity using cycle DT
+    double velocity_deg_s = 0.0;
+    if (dt_s > 0.0) {
+        velocity_deg_s = (pos_deg - last_position_deg_) / dt_s;
+    }
+    last_position_deg_ = pos_deg;
+    last_timestamp_ns_ += static_cast<uint64_t>(dt_s * 1e9);
 
     // Update Telemetry Atomically
     telem_.statusword.store(statusword, std::memory_order_release);
@@ -481,27 +558,13 @@ void EthercatAxisAdapter::process_cycle(uint8_t* domain_pd) {
     telem_.actual_position_counts.store(act_pos_counts, std::memory_order_release);
     telem_.actual_position_deg.store(pos_deg, std::memory_order_release);
     telem_.actual_torque_pct.store(act_torque / 10.0, std::memory_order_release);
-
-    timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now_ns = static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + ts.tv_nsec;
-
-    double velocity_deg_s = 0.0;
-    if (last_timestamp_ns_ != 0 && now_ns > last_timestamp_ns_) {
-        const double dt_s = static_cast<double>(now_ns - last_timestamp_ns_) * 1e-9;
-        if (dt_s > 0.0) {
-            velocity_deg_s = (pos_deg - last_position_deg_) / dt_s;
-        }
-    }
-    last_position_deg_ = pos_deg;
-    last_timestamp_ns_ = now_ns;
-
     telem_.actual_velocity_deg_s.store(velocity_deg_s, std::memory_order_release);
-    telem_.timestamp_ns.store(now_ns, std::memory_order_release);
+    telem_.timestamp_ns.store(last_timestamp_ns_, std::memory_order_release);
 
     // --- Write Process Data ---
     bool enable_req = cmd_.enable_req.load(std::memory_order_acquire);
     bool reset_req = cmd_.reset_req.exchange(false, std::memory_order_relaxed); // one-shot
+    bool homing_req = cmd_.homing_req.load(std::memory_order_acquire);
     int8_t mode = cmd_.mode_req.load(std::memory_order_acquire);
     
     uint16_t controlword = 0;
@@ -529,18 +592,45 @@ void EthercatAxisAdapter::process_cycle(uint8_t* domain_pd) {
              controlword = CmdShutdown;
          }
     }
+
+    if (mode == 6 && homing_req && is_enabled) {
+        controlword |= 0x0010; // Homing Operation Start (Bit 4)
+    }
     
     EC_WRITE_U16(domain_pd + off_ctrl_, controlword);
+    cmd_.controlword_last_sent.store(controlword, std::memory_order_release);
 
     // Target Position
     double target_deg = cmd_.target_pos_deg.load(std::memory_order_acquire);
     double target_rad = target_deg * (M_PI / 180.0);
     int32_t target_counts = static_cast<int32_t>(target_rad * counts_per_radian) + zero_offset_counts;
     
+    cmd_.target_pos_counts.store(target_counts, std::memory_order_release);
     EC_WRITE_S32(domain_pd + off_target_pos_, target_counts);
     
-    // Default Max Velocity (e.g., highly generous max velocity)
-    EC_WRITE_U32(domain_pd + off_max_vel_, 500000);
+    // Target Velocity
+    if (cmd_.has_target_vel.load(std::memory_order_acquire)) {
+        double vel_deg_s = cmd_.target_vel_deg_s.load(std::memory_order_acquire);
+        double vel_rad_s = vel_deg_s * (M_PI / 180.0);
+        int32_t target_vel_counts = static_cast<int32_t>(vel_rad_s * counts_per_radian);
+        EC_WRITE_S32(domain_pd + off_target_vel_, target_vel_counts);
+    } else {
+        EC_WRITE_S32(domain_pd + off_target_vel_, 0);
+    }
+
+    // Profile Velocity (Max Vel)
+    if (cmd_.has_profile_vel.load(std::memory_order_acquire)) {
+        double rps = cmd_.profile_vel_rpm.load(std::memory_order_acquire) / 60.0;
+        double counts_per_rev_output = counts_per_revolution_.load(std::memory_order_acquire) * gear_ratio_.load(std::memory_order_acquire);
+        uint32_t profile_vel_instr_s = static_cast<uint32_t>(rps * counts_per_rev_output);
+        EC_WRITE_U32(domain_pd + off_max_vel_, profile_vel_instr_s);
+    } else {
+        const bool has_max_profile_velocity = has_max_profile_velocity_instr_s_.load(std::memory_order_acquire);
+        const uint32_t max_profile_velocity = max_profile_velocity_instr_s_.load(std::memory_order_acquire);
+        if (has_max_profile_velocity && max_profile_velocity > 0U) {
+            EC_WRITE_U32(domain_pd + off_max_vel_, max_profile_velocity);
+        }
+    }
 }
 
 motion_core::Result<void> EthercatAxisAdapter::ensure_started() const {
@@ -549,11 +639,9 @@ motion_core::Result<void> EthercatAxisAdapter::ensure_started() const {
 }
 
 void EthercatAxisAdapter::recalculate_counts_per_radian() {
-    const auto bits = static_cast<int>(std::min<std::uint32_t>(
-        encoder_resolution_bits_.load(std::memory_order_acquire), 31U));
-    const double counts_per_rev_motor = std::ldexp(1.0, bits);
     const double counts_per_rev_output =
-        counts_per_rev_motor * gear_ratio_.load(std::memory_order_acquire);
+        static_cast<double>(counts_per_revolution_.load(std::memory_order_acquire))
+        * gear_ratio_.load(std::memory_order_acquire);
     double counts_per_radian = counts_per_rev_output / (2.0 * M_PI);
     if (!(counts_per_radian > 0.0) || !std::isfinite(counts_per_radian)) {
         counts_per_radian = 1.0;

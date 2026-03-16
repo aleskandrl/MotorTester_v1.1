@@ -15,13 +15,6 @@ void from_json(const json& j, HalBusConfigMks& b) {
     b.baud_rate = j.at("baud").get<uint32_t>();
 }
 
-void to_json(json& j, const HalBusConfigEthercat& b) {
-    j = json{{"iface", b.interface_name}};
-}
-void from_json(const json& j, HalBusConfigEthercat& b) {
-    b.interface_name = j.at("iface").get<std::string>();
-}
-
 void to_json(json& j, const HalAxisRuntimeEntry& e) {
     j = json{
         {"id", e.axis_id.value},
@@ -42,6 +35,20 @@ void from_json(const json& j, HalAxisRuntimeEntry& e) {
     e.config_file = j.at("conf").get<std::string>();
     e.enable_on_start = j.at("en").get<bool>();
 }
+
+void to_json(json& j, const HalBusConfigEthercat& b) {
+    j = json{{"iface", b.interface_name}};
+    if (!b.axes.empty()) {
+        j["axes"] = b.axes;
+    }
+}
+void from_json(const json& j, HalBusConfigEthercat& b) {
+    b.interface_name = j.at("iface").get<std::string>();
+    if (j.contains("axes")) {
+        b.axes = j.at("axes").get<std::vector<HalAxisRuntimeEntry>>();
+    }
+}
+
 
 Result<HalRuntimeConfig> load_hal_runtime_config_from_file(const std::string& path) {
     try {

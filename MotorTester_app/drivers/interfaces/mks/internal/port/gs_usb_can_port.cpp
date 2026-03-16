@@ -1,4 +1,4 @@
-#include "mks/port/gs_usb_can_port.h"
+#include "mks/internal/port/gs_usb_can_port.h"
 
 #include <libusb.h>
 
@@ -64,8 +64,8 @@ struct GsUsbCanPort::Impl {
         } m = {mode, flags};
 
         return libusb_control_transfer(dev,
-                                       LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR |
-                                           LIBUSB_RECIPIENT_INTERFACE,
+                                       static_cast<uint8_t>(LIBUSB_ENDPOINT_OUT) | static_cast<uint8_t>(LIBUSB_REQUEST_TYPE_VENDOR) |
+                                           static_cast<uint8_t>(LIBUSB_RECIPIENT_INTERFACE),
                                        GS_USB_BREQ_MODE,
                                        0,
                                        intf_num,
@@ -146,8 +146,8 @@ bool GsUsbCanPort::open(const char* device_path, unsigned int baud_rate) {
 
     uint32_t host_format = 0x0000BEEF;
     libusb_control_transfer(impl_->dev,
-                            LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR |
-                                LIBUSB_RECIPIENT_INTERFACE,
+                            static_cast<uint8_t>(LIBUSB_ENDPOINT_OUT) | static_cast<uint8_t>(LIBUSB_REQUEST_TYPE_VENDOR) |
+                                static_cast<uint8_t>(LIBUSB_RECIPIENT_INTERFACE),
                             GS_USB_BREQ_HOST_FORMAT,
                             1,
                             impl_->intf_num,
@@ -157,8 +157,8 @@ bool GsUsbCanPort::open(const char* device_path, unsigned int baud_rate) {
 
     uint8_t bt_const[40]{};
     if (libusb_control_transfer(impl_->dev,
-                                LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR |
-                                    LIBUSB_RECIPIENT_INTERFACE,
+                                static_cast<uint8_t>(LIBUSB_ENDPOINT_IN) | static_cast<uint8_t>(LIBUSB_REQUEST_TYPE_VENDOR) |
+                                    static_cast<uint8_t>(LIBUSB_RECIPIENT_INTERFACE),
                                 GS_USB_BREQ_BT_CONST,
                                 0,
                                 impl_->intf_num,
@@ -220,8 +220,8 @@ bool GsUsbCanPort::open(const char* device_path, unsigned int baud_rate) {
     Impl::write_u32(bit_timing.data() + 16, brp);
 
     if (libusb_control_transfer(impl_->dev,
-                                LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR |
-                                    LIBUSB_RECIPIENT_INTERFACE,
+                                static_cast<uint8_t>(LIBUSB_ENDPOINT_OUT) | static_cast<uint8_t>(LIBUSB_REQUEST_TYPE_VENDOR) |
+                                    static_cast<uint8_t>(LIBUSB_RECIPIENT_INTERFACE),
                                 GS_USB_BREQ_BITTIMING,
                                 0,
                                 impl_->intf_num,
@@ -254,7 +254,7 @@ bool GsUsbCanPort::write(const CanFrame& frame) {
 
     int transferred = 0;
     const int r = libusb_bulk_transfer(impl_->dev,
-                                       0x02 | LIBUSB_ENDPOINT_OUT,
+                                       static_cast<unsigned char>(0x02 | static_cast<uint8_t>(LIBUSB_ENDPOINT_OUT)),
                                        reinterpret_cast<uint8_t*>(&out),
                                        sizeof(out),
                                        &transferred,
@@ -269,7 +269,7 @@ bool GsUsbCanPort::read(CanFrame& frame, unsigned int timeout_ms) {
 
     int transferred = 0;
     const int r = libusb_bulk_transfer(impl_->dev,
-                                       0x81 | LIBUSB_ENDPOINT_IN,
+                                       static_cast<unsigned char>(0x81 | static_cast<uint8_t>(LIBUSB_ENDPOINT_IN)),
                                        impl_->rx_buf,
                                        sizeof(GsUsbFrame),
                                        &transferred,

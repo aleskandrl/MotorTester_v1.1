@@ -1,4 +1,4 @@
-#include "mks/protocol/mks_protocol.h"
+#include "mks/internal/protocol/mks_protocol.h"
 
 #include <algorithm>
 #include <chrono>

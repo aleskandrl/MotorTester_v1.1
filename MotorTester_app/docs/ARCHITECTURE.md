@@ -1,178 +1,129 @@
-# ARCHITECTURE (CANONICAL, ACTUAL)
+# ARCHITECTURE (ACTUAL)
 
-Документ фиксирует **текущую** архитектуру `MotorTester_v1` и только актуальные runtime-path.
-Исторические заметки и длинный журнал изменений должны вестись отдельно (например, в `ARCHITECTURE_LOG.md`).
+Документ фиксирует текущее состояние `MotorTester_app` после введения канонического headless runtime-модуля.
 
----
+## 1. Цель
 
-## 1) Назначение
+Система управляет приводами по двум транспортам:
 
-`MotorTester_v1` — стенд управления и диагностики осей по двум транспортам:
+- MKS CAN
+- EtherCAT (IgH / ecrt)
 
-- **MKS CAN**
-- **EtherCAT (IgH / ecrt)**
+Клиенты:
 
-Клиентские входы:
+- `motor_tester_gui` (Qt)
+- `mks_can_cli` (CLI)
 
-- **Qt GUI**: `motor_tester_gui`
-- **CLI**: `mks_can_cli`
+## 2. Канонический runtime-path
 
-Ключевой инвариант: верхний уровень работает через единый осевой контракт `motion_core::IAxis`.
-
----
-
-## 2) Актуальные runtime-path
-
-### 2.1 Qt path (production)
+### Единый headless путь (source of truth)
 
 ```text
-MainWindow / AxisWorkspace
-  -> AxisManager (QThread)
-    -> motion_core::AxisControlService
-      -> IAxis adapters
-        -> MksCanBusManager | EthercatBusManager
+Qt GUI / CLI
+  -> motion_core::HalRuntime
+    -> RuntimeFactoryRegistry
+      -> RuntimeBuildResult { buses, axes }
+        -> IBusManager (MKS/EtherCAT)
+        -> IAxis adapters (MKS/EtherCAT)
+
+Qt GUI scan
+  -> AxisManager::scan*
+    -> motion_core::HalRuntime::scan_*_topology
+      -> RuntimeFactoryRegistry topology scanners
+        -> transport discovery (MKS/EtherCAT)
 ```
 
-### 2.2 CLI path (актуальный)
+`HalRuntime` является единым API для lifecycle/config/control-path.
+
+### Qt GUI
+
+```text
+AxisWorkspace / MainWindow
+  -> AxisManager (thin Qt bridge)
+    -> motion_core::HalRuntime
+```
+
+### CLI
 
 ```text
 apps/cli/main.cpp
-  -> motion_core::AxisControlService
-    -> IAxis adapters
-      -> MksCanBusManager
+  -> motion_core::HalRuntime
 ```
 
-### 2.3 Legacy path
+`AxisControlService` удалён из production path.
 
-- Legacy-слой `AxisOrchestrator` удалён из `motion_core`.
-- Для GUI/CLI поддерживается единый control-path через `motion_core::AxisControlService`.
+## 3. Слои
 
-### 2.4 Configuration path (Phase 1-2)
+### motion_core (Qt-free)
 
-- **Master Bootstrap Config (`HalRuntimeConfig`)**: Описывает топологию шин и базовую адресацию (CAN ID, EtherCAT station). Используется для открытия рантайма.
-- **Runtime Axis Config (`AxisConfig`)**: Полный снимок прикладных параметров (PID, Gear Ratio, Limits). Применяется к уже обнаруженным осям.
-
----
-
-## 3) Слои системы
-
-### 3.1 `motion_core` (Qt-independent)
-
-Содержит:
-
-- `IAxis`
-- `AxisControlService` (единственная точка входа API, оркестрация рантайма, команды, телеметрия, параметры, motion queue)
+- `IAxis`, `IBusManager`
+- `RuntimeFactoryRegistry`
+- `HalRuntime` (канонический headless orchestration)
 - `RuntimeLoop`
-- `Result<T>`, `ErrorCode`, типы оси/параметров/телеметрии
+- `Result<T>`, типы осей/телеметрии/параметров
 
-Инвариант: `motion_core` не знает о Qt и не зависит от деталей транспортного протокола.
+### drivers/interfaces/mks
 
-### 3.2 MKS stack (`drivers/interfaces/mks`)
-
-- `ICanPort` + реализации (`GsUsbCanPort`, `SimCanPort`)
-- `MksProtocol`
 - `MksCanBusManager`
 - `MksAxisAdapter : IAxis`
-- `mks_runtime_config` / `mks_runtime_factory`
+- `mks_runtime_factory`
+- `mks_dictionary`
 
-### 3.3 EtherCAT stack (`drivers/interfaces/ethercat`)
+### drivers/interfaces/ethercat
 
 - `EthercatBusManager`
 - `EthercatAxisAdapter : IAxis`
 - `ethercat_runtime_factory`
+- `p100e_ethercat_dictionary`
 
-### 3.4 Application layer
+### ui/qt/mks
 
-- `apps/qt/qt_main.cpp`, `ui/qt/mks/*`
-- `apps/cli/main.cpp`
-- `AxisManager` как bridge между UI и `AxisControlService`
-- Deprecated API-методы `applyBasicConfig/readBasicConfig/changeCanId` удалены из `AxisManager`.
+- `AxisManager`: Qt bridge + safety/policy + сигналы/слоты UI
+- `AxisWorkspace`: HMI, команды, телеметрия, parameter tree
 
----
+## 4. Runtime responsibilities
 
-## 4) Runtime особенности
+### HalRuntime
 
-### 4.1 MKS CAN
+- `open_from_config/start/stop/close`
+- `scan_mks_topology/scan_ethercat_topology` (headless scan API)
+- `find_axis/list_axes`
+- доступ к bus snapshot для статистики
+- `export_axis_config_to_file/apply_axis_config_file`
 
-`MksCanBusManager`:
+### AxisManager
 
-- владеет портом и протоколом;
-- обслуживает async-команды (очередь, priority path для emergency);
-- выполняет sync-транзакции параметров;
-- выполняет polling-цикл телеметрии.
+- делегирование runtime lifecycle в `HalRuntime`
+- делегирование scan в `HalRuntime` (без transport-specific includes/calls в UI)
+- safety baseline после критичных операций
+- bridge к UI (signals/slots, timers, QVariant адаптация)
 
-Актуальная защита от конкуренции sync/RT:
+## 5. Safety / policy
 
-- на время sync-транзакции активируется `sync_transaction_active_`;
-- `poll_cycle()` пропускает I/O при активной sync-транзакции (изоляция sync path от RT poll path).
+- Единый safety baseline применяется в `AxisManager` после критичных операций.
+- Runtime lifecycle выполняется через `HalRuntime`, вызываемый из `AxisManager`/CLI.
+- MKS `0x8C` (`SlaveRespond/Active`) policy-locked: запись через patch API запрещена, чтобы исключить отключение ответов привода и потерю телеметрии.
+- Raw command UI-path деактивирован в unified runtime (только typed API/parameter tree).
 
-### 4.2 EtherCAT
+## 6. Параметры и конфиги
 
-`EthercatBusManager`:
+- Источники параметров: dictionary-слои MKS/EtherCAT.
+- UI строит parameter tree через `IAxis::list_parameters()`.
+- Export/import осевого конфига выполняется через `HalRuntime` (persistable + writable policy).
+- По умолчанию в GUI используются текущие считанные значения с привода; auto-apply осевого конфига при scan/open/start не выполняется.
+- `HalRuntimeConfig` остаётся master bootstrap config для mixed runtime.
 
-- `open/scan/start_runtime/stop_runtime`;
-- циклический обмен PDO через зарегистрированные адаптеры.
+## 7. Command truth-source
 
-`AxisManager`:
+Канонический источник соответствия команд и семантики:
 
-- scan-flow строит runtime поверх уже открытого bus-manager;
-- дублирующий `startRuntime()` при уже запущенных осях пропускается (idempotent guard).
+- `docs/mks_protocol_description.md`
+- вендорная документация (PDF/ESI)
 
----
+Любое расхождение между деревом команд/UI и документацией трактуется как дефект реализации.
 
-## 5) Потоки и синхронизация
+## 8. Командная адресация в runtime (MKS)
 
-Потоки:
-
-- `T_UI`: Qt main thread
-- `T_MANAGER`: поток `AxisManager`
-- `T_BUS_MKS`: runtime loop в `MksCanBusManager`
-- `T_BUS_ECAT`: runtime loop в `EthercatBusManager`
-- `T_AXIS_TRAJ`: trajectory thread в `AxisWorkspace`
-
-Основные примитивы:
-
-- `MksCanBusManager`: `state_mutex_`, `queue_mutex_`, `io_mutex_`, `sync_mutex_`
-- `AxisControlService`: внутренний mutex для реестра осей и queue
-- `AxisWorkspace`: `trajectory_mutex_` + atomics
-
----
-
-## 6) Команды и параметры
-
-- Командный API: через `AxisControlService` (`enable_axis`, `set_axis_mode`, `submit_command`, motion queue API)
-- Параметрический API: `list_parameters/read_parameters/apply_parameter_patch` через `IAxis`
-- Safety baseline: реализован в `AxisControlService`, вызывается из `AxisManager` после критичных операций
-
----
-
-## 7) Build
-
-- C++20, GCC required
-- Таргеты: `mks_can_cli`, `motor_tester_gui`, `motion_core`
-- `mks_can_cli` не использует Qt UI include-директорию
-
----
-
-## 8) Что намеренно исключено из этого файла
-
-- длинный исторический changelog;
-- временные аудиторские заметки;
-- устаревшие/экспериментальные execution-path без пометки legacy.
-
-Этот файл описывает только текущее состояние архитектуры.
-
----
-
-## 9) Актуальные остаточные риски
-
-- Для MKS под нагрузкой возможны деградации telemetry/джиттер из-за ограничений bandwidth и общего I/O ресурса;
-- В UI есть отдельный trajectory thread в `AxisWorkspace`, параллельный core motion queue — требуется дальнейшая унификация.
-
-
----
-
-## 10) Каноничность
-
-`ARCHITECTURE.md` — каноничное описание текущей архитектуры.
-При изменении runtime-path документ обновляется синхронно с кодом.
+- Для CAN-native runtime используется 11-bit адресация CAN ID: `0x001..0x7FF`.
+- Команда `8B` (Set CAN ID): writable runtime-команда, но non-persistable в `AxisConfig`.
+- Команда `8D` (Set Group ID): диапазон runtime `0x001..0x7FF`.

@@ -41,7 +41,7 @@ public:
     motion_core::Result<void> apply_parameter_patch(const motion_core::ParameterPatch& patch) override;
 
     // Called by EthercatBusManager's RT loop
-    void process_cycle(uint8_t* domain_pd);
+    void process_cycle(uint8_t* domain_pd, double dt_s);
 
 private:
     motion_core::Result<void> ensure_started() const;
@@ -56,7 +56,15 @@ private:
         std::atomic<int8_t> mode_req{8}; // CSP
         std::atomic<bool> emergency_stop_req{false};
         std::atomic<double> target_pos_deg{0.0};
+        std::atomic<std::int32_t> target_pos_counts{0};
+        std::atomic<std::uint16_t> controlword_last_sent{0};
         std::atomic<bool> quick_stop_req{false};
+        std::atomic<bool> homing_req{false};
+        std::atomic<bool> set_zero_req{false};
+        std::atomic<bool> has_target_vel{false};
+        std::atomic<double> target_vel_deg_s{0.0};
+        std::atomic<bool> has_profile_vel{false};
+        std::atomic<std::uint16_t> profile_vel_rpm{0};
     };
     
     // Telemetry atomic state from RT to NRT
@@ -84,10 +92,16 @@ private:
     // PDO offsets assigned by ecrt
     unsigned int off_ctrl_{0}, off_target_pos_{0}, off_modes_op_{0}, off_max_vel_{0};
     unsigned int off_status_{0}, off_act_pos_{0}, off_error_{0}, off_act_torque_{0};
+    unsigned int off_target_vel_{0};
     
     // Hardware params
     std::atomic<double> gear_ratio_{1.0};
-    std::atomic<std::uint32_t> encoder_resolution_bits_{17};
+    // Instruction units per motor revolution (0x6091:02, default 10000).
+    // PDO 0x6064/0x607A use these units — NOT raw encoder counts.
+    std::atomic<std::uint32_t> counts_per_revolution_{10000};
+    std::atomic<std::uint32_t> max_profile_velocity_instr_s_{0};
+    std::atomic<bool> has_max_profile_velocity_instr_s_{false};
+    std::atomic<std::uint32_t> encoder_resolution_bits_{17}; // PA95 bits, informational only
     std::atomic<double> counts_per_radian_{1.0};
     std::atomic<std::int32_t> zero_offset_counts_{0};
     double last_position_deg_{0.0};

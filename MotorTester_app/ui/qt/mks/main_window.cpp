@@ -2,7 +2,7 @@
 
 #include "mks/axis_manager.h"
 #include "mks/axis_workspace.h"
-#include "mks/port/gs_usb_can_port.h"
+#include "mks/internal/port/gs_usb_can_port.h"
 
 #include <QDateTime>
 #include <QComboBox>
@@ -19,6 +19,7 @@
 #include <QPushButton>
 #include <QSpinBox>
 #include <QTableWidget>
+#include <QToolBox>
 #include <QTextEdit>
 #include <QThread>
 #include <QTreeWidget>
@@ -47,17 +48,37 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         }
     });
     
-    connect(manager_, &mks::AxisManager::busStatisticsUpdated, this, [this](double cycle_rate_hz, double bus_load_percent) {
+    connect(manager_, &mks::AxisManager::busStatisticsUpdated, this, [this](const QVariantMap& bus_stats) {
+        bool has_mks = false;
+        bool has_ecat = false;
+        
+        for (auto it = bus_stats.constBegin(); it != bus_stats.constEnd(); ++it) {
+            const QString& bus_name = it.key();
+            const QVariantMap& stats = it.value().toMap();
+            const double cycle_rate_hz = stats["cycle_rate_hz"].toDouble();
+            const double bus_load_percent = stats["bus_load_percent"].toDouble();
+
+            if (bus_name.contains("MKS")) {
+                has_mks = true;
+                if (mks_bus_load_label_) mks_bus_load_label_->setText(QString::number(bus_load_percent, 'f', 1) + "%");
+                if (mks_bus_rate_label_) mks_bus_rate_label_->setText(QString::number(cycle_rate_hz, 'f', 1) + " Hz");
+            } else if (bus_name.contains("EtherCAT")) {
+                has_ecat = true;
+                if (ecat_bus_load_label_) ecat_bus_load_label_->setText(QString::number(bus_load_percent, 'f', 1) + "%");
+                if (ecat_bus_rate_label_) ecat_bus_rate_label_->setText(QString::number(cycle_rate_hz, 'f', 1) + " Hz");
+            }
+        }
+        
+        if (!has_mks) {
+            if (mks_bus_load_label_) mks_bus_load_label_->setText("--- %");
+            if (mks_bus_rate_label_) mks_bus_rate_label_->setText("--- Hz");
+        }
+        if (!has_ecat) {
+            if (ecat_bus_load_label_) ecat_bus_load_label_->setText("--- %");
+            if (ecat_bus_rate_label_) ecat_bus_rate_label_->setText("--- Hz");
+        }
         if (status_stats_label_) {
-            status_stats_label_->setText(QString("Bus Load: %1% | Cycle Rate: %2 Hz")
-                                            .arg(bus_load_percent, 0, 'f', 1)
-                                            .arg(cycle_rate_hz, 0, 'f', 1));
-        }
-        if (bus_load_value_label_) {
-            bus_load_value_label_->setText(QString::number(bus_load_percent, 'f', 1) + "%");
-        }
-        if (bus_rate_value_label_) {
-            bus_rate_value_label_->setText(QString::number(cycle_rate_hz, 'f', 1) + " Hz");
+            status_stats_label_->setText(QString("Active Buses: %1").arg(bus_stats.size()));
         }
     });
 
@@ -158,6 +179,13 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         }
     });
 
+    connect(btn_save_hal_, &QPushButton::clicked, this, [this]() {
+        const QString path = QFileDialog::getSaveFileName(this, "Save Master HAL Config", "master_config.json", "JSON Files (*.json)");
+        if (!path.isEmpty()) {
+            QMetaObject::invokeMethod(manager_, "saveHalConfig", Qt::QueuedConnection, Q_ARG(QString, path));
+        }
+    });
+
     connect(findChild<QPushButton*>("btn_refresh"), &QPushButton::clicked, this, [this]() {
         const QString prev_selected = device_combo_->currentData().toString();
         device_combo_->clear();
@@ -210,6 +238,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(btn_ecat_scan_, &QPushButton::clicked, this, [this]() {
         QMetaObject::invokeMethod(manager_, "scanEthercatMotors", Qt::QueuedConnection);
     });
+    connect(btn_ecat_close_, &QPushButton::clicked, this, [this]() {
+        QMetaObject::invokeMethod(manager_, "closeDevice", Qt::QueuedConnection);
+    });
     connect(btn_ecat_start_runtime_, &QPushButton::clicked, this, [this]() {
         QMetaObject::invokeMethod(manager_, "startRuntime", Qt::QueuedConnection);
     });
@@ -239,75 +270,101 @@ void MainWindow::setupUi() {
     auto* network_host = new QWidget(dock_network);
     auto* network_layout = new QVBoxLayout(network_host);
 
-    auto* form = new QFormLayout();
-    device_combo_ = new QComboBox(this);
-    baud_combo_ = new QComboBox(this);
+    auto* conn_tabs = new QToolBox(network_host);
+    network_layout->addWidget(conn_tabs);
+
+    // MKS CAN Tab
+    auto* mks_tab = new QWidget(conn_tabs);
+    auto* mks_layout = new QVBoxLayout(mks_tab);
+    
+    auto* mks_form = new QFormLayout();
+    device_combo_ = new QComboBox(mks_tab);
+    baud_combo_ = new QComboBox(mks_tab);
     baud_combo_->addItem("125000", 125000);
     baud_combo_->addItem("250000", 250000);
     baud_combo_->addItem("500000", 500000);
     baud_combo_->addItem("1000000", 1000000);
     baud_combo_->setCurrentText("500000");
-    scan_max_id_spin_ = new QSpinBox(this);
+    scan_max_id_spin_ = new QSpinBox(mks_tab);
     scan_max_id_spin_->setRange(1, 2047);
     scan_max_id_spin_->setValue(64);
     
-    form->addRow("Device:", device_combo_);
-    form->addRow("Baud:", baud_combo_);
-    form->addRow("Scan max:", scan_max_id_spin_);
-    network_layout->addLayout(form);
+    mks_form->addRow("Interface:", device_combo_);
+    mks_form->addRow("Baudrate:", baud_combo_);
+    mks_form->addRow("Max Node ID:", scan_max_id_spin_);
+    mks_layout->addLayout(mks_form);
 
-    auto* btn_row1 = new QHBoxLayout();
-    auto* btn_refresh = new QPushButton("Refresh", this);
+    auto* btn_mks_row1 = new QHBoxLayout();
+    btn_open_ = new QPushButton("Open Master", mks_tab);
+    auto* btn_refresh = new QPushButton("Refresh List", mks_tab);
     btn_refresh->setObjectName("btn_refresh");
-    btn_open_ = new QPushButton("Open", this);
-    btn_close_ = new QPushButton("Close", this);
-    btn_load_hal_ = new QPushButton("Load Master HAL", this);
-    btn_row1->addWidget(btn_refresh);
-    btn_row1->addWidget(btn_open_);
-    btn_row1->addWidget(btn_close_);
-    network_layout->addLayout(btn_row1);
-    network_layout->addWidget(btn_load_hal_);
+    btn_mks_row1->addWidget(btn_open_);
+    btn_mks_row1->addWidget(btn_refresh);
+    mks_layout->addLayout(btn_mks_row1);
 
-    auto* btn_row2 = new QHBoxLayout();
-    auto* btn_scan = new QPushButton("Scan", this);
+    auto* btn_mks_row2 = new QHBoxLayout();
+    auto* btn_scan = new QPushButton("Scan Network", mks_tab);
     btn_scan->setObjectName("btn_scan");
-    btn_row2->addWidget(btn_scan);
-    network_layout->addLayout(btn_row2);
+    btn_close_ = new QPushButton("Close Master", mks_tab);
+    btn_mks_row2->addWidget(btn_scan);
+    btn_mks_row2->addWidget(btn_close_);
+    mks_layout->addLayout(btn_mks_row2);
 
-    // EtherCAT Panel
-    auto* ecat_group = new QGroupBox("EtherCAT Network", this);
-    auto* ecat_layout = new QVBoxLayout(ecat_group);
+    auto* mks_stats_group = new QGroupBox("Bus Statistics", mks_tab);
+    auto* mks_stats_form = new QFormLayout(mks_stats_group);
+    mks_bus_load_label_ = new QLabel("--- %", mks_stats_group);
+    mks_bus_rate_label_ = new QLabel("--- Hz", mks_stats_group);
+    mks_stats_form->addRow("Load:", mks_bus_load_label_);
+    mks_stats_form->addRow("Cycle rate:", mks_bus_rate_label_);
+    mks_layout->addWidget(mks_stats_group);
+
+    mks_layout->addStretch();
+    conn_tabs->addItem(mks_tab, "MKS CAN Interface");
+
+    // EtherCAT Tab
+    auto* ecat_tab = new QWidget(conn_tabs);
+    auto* ecat_layout = new QVBoxLayout(ecat_tab);
     
     auto* ecat_form = new QFormLayout();
-    ethercat_iface_edit_ = new QLineEdit("enp2s0", this); // Hardware interface name
+    ethercat_iface_edit_ = new QLineEdit("enp2s0", ecat_tab);
     ecat_form->addRow("Interface:", ethercat_iface_edit_);
+    
+    chk_ecat_auto_connect_ = new QCheckBox("Auto-Connect Axes", ecat_tab);
+    chk_ecat_auto_connect_->setChecked(true);
+    ecat_form->addRow("", chk_ecat_auto_connect_);
     ecat_layout->addLayout(ecat_form);
     
-    auto* ecat_btn_row = new QHBoxLayout();
-    btn_ecat_open_ = new QPushButton("Master Open", this);
-    btn_ecat_scan_ = new QPushButton("Scan", this);
-    
-    chk_ecat_auto_connect_ = new QCheckBox("Auto-Connect", this);
-    chk_ecat_auto_connect_->setChecked(true);
-    
-    btn_ecat_start_runtime_ = new QPushButton("Connect", this);
-    btn_ecat_start_runtime_->setStyleSheet("color: blue; font-weight: bold;");
-    
-    ecat_btn_row->addWidget(btn_ecat_open_);
-    ecat_btn_row->addWidget(btn_ecat_scan_);
-    ecat_btn_row->addWidget(chk_ecat_auto_connect_);
-    ecat_btn_row->addWidget(btn_ecat_start_runtime_);
-    ecat_layout->addLayout(ecat_btn_row);
-    
-    network_layout->addWidget(ecat_group);
+    auto* ecat_btn_row1 = new QHBoxLayout();
+    btn_ecat_open_ = new QPushButton("Open Master", ecat_tab);
+    btn_ecat_start_runtime_ = new QPushButton("Connect Axes", ecat_tab);
+    ecat_btn_row1->addWidget(btn_ecat_open_);
+    ecat_btn_row1->addWidget(btn_ecat_start_runtime_);
+    ecat_layout->addLayout(ecat_btn_row1);
 
-    auto* bus_stats_group = new QGroupBox("Bus statistics", this);
-    auto* bus_stats_form = new QFormLayout(bus_stats_group);
-    bus_load_value_label_ = new QLabel("--- %", bus_stats_group);
-    bus_rate_value_label_ = new QLabel("--- Hz", bus_stats_group);
-    bus_stats_form->addRow("Load:", bus_load_value_label_);
-    bus_stats_form->addRow("Cycle rate:", bus_rate_value_label_);
-    network_layout->addWidget(bus_stats_group);
+    auto* ecat_btn_row2 = new QHBoxLayout();
+    btn_ecat_scan_ = new QPushButton("Scan Network", ecat_tab);
+    btn_ecat_close_ = new QPushButton("Close Master", ecat_tab);
+    ecat_btn_row2->addWidget(btn_ecat_scan_);
+    ecat_btn_row2->addWidget(btn_ecat_close_);
+    ecat_layout->addLayout(ecat_btn_row2);
+
+    auto* ecat_stats_group = new QGroupBox("Bus Statistics", ecat_tab);
+    auto* ecat_stats_form = new QFormLayout(ecat_stats_group);
+    ecat_bus_load_label_ = new QLabel("--- %", ecat_stats_group);
+    ecat_bus_rate_label_ = new QLabel("--- Hz", ecat_stats_group);
+    ecat_stats_form->addRow("Load:", ecat_bus_load_label_);
+    ecat_stats_form->addRow("Cycle rate:", ecat_bus_rate_label_);
+    ecat_layout->addWidget(ecat_stats_group);
+
+    ecat_layout->addStretch();
+    conn_tabs->addItem(ecat_tab, "EtherCAT Interface");
+
+    auto* btn_hal_row = new QHBoxLayout();
+    btn_load_hal_ = new QPushButton("Load Config...", network_host);
+    btn_save_hal_ = new QPushButton("Save Config...", network_host);
+    btn_hal_row->addWidget(btn_load_hal_);
+    btn_hal_row->addWidget(btn_save_hal_);
+    network_layout->addLayout(btn_hal_row);
 
     topology_tree_ = new QTreeWidget(this);
     topology_tree_->setHeaderLabel("Deployment Topology");

@@ -6,8 +6,12 @@
 #include <QVariantList>
 #include <QVariantMap>
 
-#include "motion_core/axis_control_service.h"
+#include "motion_core/axis_interface.h"
+#include "motion_core/bus_manager_interface.h"
+#include "motion_core/hal_runtime.h"
 #include "motion_core/result.h"
+#include "motion_core/config/hal_runtime_config.h"
+#include "motion_core/config/axis_config.h"
 
 #include <cstdint>
 #include <memory>
@@ -15,12 +19,11 @@
 
 class QTimer;
 
-namespace motion_core {
-}
-
 namespace mks {
-class ICanPort;
-class MksProtocol;
+// Removed ICanPort, MksProtocol, MksCanBusManager forward declarations
+// class ICanPort;
+// class MksProtocol;
+// class MksCanBusManager;
 
 class AxisManager : public QObject {
     Q_OBJECT
@@ -60,6 +63,7 @@ public slots:
 
     void loadRuntimeConfig(const QString& config_path);
     void loadHalConfig(const QString& config_path);
+    void saveHalConfig(const QString& config_path);
     void startRuntime();
     void stopRuntime();
 
@@ -74,7 +78,7 @@ signals:
     void scanFinished(const QVariantList& axis_ids);
     void ethercatScanFinished(const QVariantList& axis_ids);
     void telemetryUpdated(int axis_id, const QVariantMap& telemetry);
-    void busStatisticsUpdated(double cycle_rate_hz, double bus_load_percent);
+    void busStatisticsUpdated(const QVariantMap& bus_stats);
     void configReadback(int axis_id, const QVariantMap& config);
     void parameterListReady(int axis_id, const QVariantList& params);
     void parametersRead(int axis_id, const QVariantList& params);
@@ -83,20 +87,34 @@ private slots:
     void onFastTick();
 
 private:
+    enum class ActiveTransport {
+        None = 0,
+        Mks,
+        Ethercat,
+    };
+
     bool isReady() const;
+    void applySafetyBaselineForAxis(int axis_id, const QString& reason, bool force_disable = true);
 
     void reset_runtime_state();
-    motion_core::Result<std::vector<std::uint16_t>> discover_axes(const QString& device_path,
-                                                                  int baud_rate,
-                                                                  int max_id) const;
+    motion_core::Result<void> startRuntimeHeadless();
 
-    std::unique_ptr<motion_core::AxisControlService> control_service_;
+    motion_core::Result<void> openRuntimeFromConfig(const motion_core::HalRuntimeConfig& config);
+    motion_core::Result<void> closeRuntimeInternal();
+    motion_core::Result<void> startRuntimeInternal();
+    motion_core::Result<void> stopRuntimeInternal();
+    motion_core::Result<std::shared_ptr<motion_core::IAxis>> findAxis(std::uint16_t axis_id) const;
+    motion_core::Result<std::vector<motion_core::AxisInfo>> listAxes() const;
+
+    motion_core::HalRuntime hal_runtime_;
     QSet<int> runtime_known_axes_;
     QSet<int> runtime_started_axes_;
     QString runtime_config_path_;
     QString opened_device_path_;
     int opened_baud_rate_{0};
     bool device_opened_{false};
+    ActiveTransport active_transport_{ActiveTransport::None};
+    motion_core::HalRuntimeConfig current_hal_config_{};
 
     QTimer* fast_timer_{nullptr};
     QTimer* slow_timer_{nullptr};

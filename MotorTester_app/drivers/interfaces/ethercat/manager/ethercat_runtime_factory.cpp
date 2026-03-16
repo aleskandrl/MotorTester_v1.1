@@ -8,28 +8,28 @@ namespace ethercat_driver {
 
 namespace {
 
-motion_core::Result<EthercatRuntimeBuildResult> build_axes_on_bus(
+motion_core::Result<motion_core::RuntimeBuildResult> build_axes_on_bus(
     const std::shared_ptr<EthercatBusManager>& bus_manager,
     const std::vector<EthercatAxisRuntimeConfig>& axes,
     const bool close_bus_on_failure) {
     if (!bus_manager) {
-        return motion_core::Result<EthercatRuntimeBuildResult>::failure(
+        return motion_core::Result<motion_core::RuntimeBuildResult>::failure(
             {motion_core::ErrorCode::InvalidArgument, "ethercat runtime has null bus manager"});
     }
     if (axes.empty()) {
-        return motion_core::Result<EthercatRuntimeBuildResult>::failure(
+        return motion_core::Result<motion_core::RuntimeBuildResult>::failure(
             {motion_core::ErrorCode::InvalidArgument, "ethercat runtime config has no axes"});
     }
 
-    EthercatRuntimeBuildResult out{};
-    out.bus_manager = bus_manager;
+    motion_core::RuntimeBuildResult out{};
+    out.bus_managers.push_back(bus_manager);
 
-    auto fail_and_close = [&out, close_bus_on_failure](const motion_core::Error& error)
-        -> motion_core::Result<EthercatRuntimeBuildResult> {
-        if (close_bus_on_failure && out.bus_manager) {
-            (void)out.bus_manager->close();
+    auto fail_and_close = [bus_manager, close_bus_on_failure](const motion_core::Error& error)
+        -> motion_core::Result<motion_core::RuntimeBuildResult> {
+        if (close_bus_on_failure && bus_manager) {
+            (void)bus_manager->close();
         }
-        return motion_core::Result<EthercatRuntimeBuildResult>::failure(error);
+        return motion_core::Result<motion_core::RuntimeBuildResult>::failure(error);
     };
 
     std::unordered_set<std::uint16_t> axis_ids_seen;
@@ -51,7 +51,7 @@ motion_core::Result<EthercatRuntimeBuildResult> build_axes_on_bus(
                 {motion_core::ErrorCode::AlreadyExists, "duplicate axis_id in ethercat runtime config"});
         }
 
-        const auto axis_info_result = out.bus_manager->get_slave_bus_info(axis_id_raw);
+        const auto axis_info_result = bus_manager->get_slave_bus_info(axis_id_raw);
         if (!axis_info_result.ok()) {
             return fail_and_close(
                 {motion_core::ErrorCode::NotFound, "axis_id from config is not present on scanned EtherCAT bus"});
@@ -62,7 +62,7 @@ motion_core::Result<EthercatRuntimeBuildResult> build_axes_on_bus(
         adapter_cfg.axis_name = axis_cfg.axis_name;
         adapter_cfg.ecat_axis_index = axis_info_result.value().runtime_index;
         adapter_cfg.ecat_bus_position = axis_info_result.value().bus_position;
-        adapter_cfg.bus_manager = out.bus_manager;
+        adapter_cfg.bus_manager = bus_manager;
 
         auto adapter = make_ethercat_axis_adapter(std::move(adapter_cfg));
         auto config_res = adapter->configure_hardware();
@@ -73,33 +73,46 @@ motion_core::Result<EthercatRuntimeBuildResult> build_axes_on_bus(
         out.axes.push_back(std::move(adapter));
     }
 
-    return motion_core::Result<EthercatRuntimeBuildResult>::success(std::move(out));
+    return motion_core::Result<motion_core::RuntimeBuildResult>::success(std::move(out));
 }
 
 } // namespace
 
-motion_core::Result<EthercatRuntimeBuildResult> build_ethercat_runtime_on_existing_bus(
+motion_core::Result<motion_core::RuntimeBuildResult> build_ethercat_runtime_on_existing_bus(
     const std::shared_ptr<EthercatBusManager>& bus_manager,
     const std::vector<EthercatAxisRuntimeConfig>& axes) {
     return build_axes_on_bus(bus_manager, axes, false);
 }
 
-motion_core::Result<EthercatRuntimeBuildResult> build_ethercat_runtime(const EthercatRuntimeConfig& config) {
+motion_core::Result<motion_core::RuntimeBuildResult> build_ethercat_runtime(const motion_core::HalRuntimeConfig& hal_config) {
+    EthercatRuntimeConfig config;
+    if (!hal_config.ethercat_buses.empty()) {
+        config.bus.interface_name = hal_config.ethercat_buses[0].interface_name;
+    }
+    for (const auto& axis : hal_config.axes) {
+        if (axis.transport == motion_core::AxisTransportKind::Ethercat) {
+            EthercatAxisRuntimeConfig a;
+            a.axis_id = axis.axis_id;
+            a.axis_name = axis.axis_name;
+            config.axes.push_back(a);
+        }
+    }
+
     if (config.bus.interface_name.empty()) {
-        return motion_core::Result<EthercatRuntimeBuildResult>::failure(
+        return motion_core::Result<motion_core::RuntimeBuildResult>::failure(
             {motion_core::ErrorCode::InvalidArgument, "ethercat runtime config has empty interface_name"});
     }
 
     auto bus_manager = make_ethercat_bus_manager(config.bus);
     const auto open_result = bus_manager->open();
     if (!open_result.ok()) {
-        return motion_core::Result<EthercatRuntimeBuildResult>::failure(open_result.error());
+        return motion_core::Result<motion_core::RuntimeBuildResult>::failure(open_result.error());
     }
 
     const auto discovered = bus_manager->scan_axes();
     if (!discovered.ok()) {
         (void)bus_manager->close();
-        return motion_core::Result<EthercatRuntimeBuildResult>::failure(discovered.error());
+        return motion_core::Result<motion_core::RuntimeBuildResult>::failure(discovered.error());
     }
 
     return build_axes_on_bus(bus_manager, config.axes, true);

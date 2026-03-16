@@ -1,6 +1,6 @@
-#include "mks/port/sim_can_port.h"
+#include "mks/internal/port/sim_can_port.h"
 
-#include "mks/protocol/mks_protocol.h"
+#include "mks/internal/protocol/mks_protocol.h"
 
 #include <algorithm>
 #include <chrono>
@@ -223,8 +223,10 @@ bool SimCanPort::handle_frame(const CanFrame& frame) {
         case 0xF6: { // RunSpeedMode
             if (req.size() >= 4) {
                 const std::uint16_t speed = static_cast<std::uint16_t>(((req[1] & 0x0F) << 8) | req[2]);
-                const bool ccw = (req[1] & 0x80) != 0;
-                axis.speed_rpm = static_cast<std::int16_t>(ccw ? -static_cast<int>(speed) : static_cast<int>(speed));
+                // Protocol-aligned direction for F6:
+                // bit7=0 -> CCW (positive RPM), bit7=1 -> CW (negative RPM)
+                const bool clockwise = (req[1] & 0x80) != 0;
+                axis.speed_rpm = static_cast<std::int16_t>(clockwise ? -static_cast<int>(speed) : static_cast<int>(speed));
                 axis.axis_position += axis.speed_rpm / 2;
                 axis.motion_active = false;
                 axis.status = 0x02;

@@ -7,13 +7,37 @@
 
 namespace mks {
 
-motion_core::Result<MksRuntimeBuildResult> build_mks_runtime(const MksRuntimeConfig& config) {
-    if (config.buses.empty()) {
-        return motion_core::Result<MksRuntimeBuildResult>::failure(
-            {motion_core::ErrorCode::InvalidArgument, "runtime config has no buses"});
+motion_core::Result<motion_core::RuntimeBuildResult> build_mks_runtime(const motion_core::HalRuntimeConfig& hal_config) {
+    if (hal_config.mks_buses.empty()) {
+        return motion_core::Result<motion_core::RuntimeBuildResult>::failure(
+            {motion_core::ErrorCode::InvalidArgument, "runtime config has no MKS buses"});
     }
 
-    MksRuntimeBuildResult out{};
+    MksRuntimeConfig config;
+    for (const auto& bus : hal_config.mks_buses) {
+        MksBusRuntimeConfig b;
+        b.interface_id = bus.interface_id;
+        b.device_path = bus.device_path;
+        b.baud_rate = bus.baud_rate;
+        config.buses.push_back(std::move(b));
+    }
+    for (const auto& axis : hal_config.axes) {
+        if (axis.transport == motion_core::AxisTransportKind::CanBus) {
+            MksAxisRuntimeConfig a;
+            a.axis_id = axis.axis_id;
+            a.axis_name = axis.axis_name;
+            a.can_id = axis.transport_address;
+            
+            for (auto& bus : config.buses) {
+                if (bus.interface_id == axis.bus_ref) {
+                    bus.axes.push_back(a);
+                    break;
+                }
+            }
+        }
+    }
+
+    motion_core::RuntimeBuildResult out{};
     std::unordered_set<std::uint16_t> axis_ids_seen;
 
     for (const auto& bus_cfg : config.buses) {
@@ -30,21 +54,21 @@ motion_core::Result<MksRuntimeBuildResult> build_mks_runtime(const MksRuntimeCon
 
         for (const auto& axis_cfg : bus_cfg.axes) {
             if (!axis_cfg.axis_id.valid()) {
-                return motion_core::Result<MksRuntimeBuildResult>::failure(
+                return motion_core::Result<motion_core::RuntimeBuildResult>::failure(
                     {motion_core::ErrorCode::InvalidArgument, "axis_id must be > 0"});
             }
             if (axis_cfg.axis_name.value.empty()) {
-                return motion_core::Result<MksRuntimeBuildResult>::failure(
+                return motion_core::Result<motion_core::RuntimeBuildResult>::failure(
                     {motion_core::ErrorCode::InvalidArgument, "axis_name cannot be empty"});
             }
 
             const auto axis_id_raw = axis_cfg.axis_id.value;
             if (!axis_ids_seen.insert(axis_id_raw).second) {
-                return motion_core::Result<MksRuntimeBuildResult>::failure(
+                return motion_core::Result<motion_core::RuntimeBuildResult>::failure(
                     {motion_core::ErrorCode::AlreadyExists, "duplicate axis_id in runtime config"});
             }
             if (!can_ids_seen.insert(axis_cfg.can_id).second) {
-                return motion_core::Result<MksRuntimeBuildResult>::failure(
+                return motion_core::Result<motion_core::RuntimeBuildResult>::failure(
                     {motion_core::ErrorCode::AlreadyExists, "duplicate can_id within one bus config"});
             }
 
@@ -63,11 +87,11 @@ motion_core::Result<MksRuntimeBuildResult> build_mks_runtime(const MksRuntimeCon
     }
 
     if (out.axes.empty()) {
-        return motion_core::Result<MksRuntimeBuildResult>::failure(
+        return motion_core::Result<motion_core::RuntimeBuildResult>::failure(
             {motion_core::ErrorCode::InvalidArgument, "runtime config has no axes"});
     }
 
-    return motion_core::Result<MksRuntimeBuildResult>::success(std::move(out));
+    return motion_core::Result<motion_core::RuntimeBuildResult>::success(std::move(out));
 }
 
 } // namespace mks

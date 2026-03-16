@@ -48,7 +48,7 @@ motion_core::Result<void> EthercatBusManager::open() {
 }
 
 motion_core::Result<void> EthercatBusManager::close() {
-    (void)stop_runtime();
+    (void)stop();
 
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (master_) {
@@ -112,6 +112,54 @@ motion_core::Result<std::vector<std::uint16_t>> EthercatBusManager::scan_axes() 
     return motion_core::Result<std::vector<std::uint16_t>>::success(std::move(out));
 }
 
+motion_core::Result<motion_core::HalBusConfigEthercat> EthercatBusManager::discover_ethercat_topology(
+    const std::string& interface_name) {
+    if (interface_name.empty()) {
+        return motion_core::Result<motion_core::HalBusConfigEthercat>::failure(
+            {motion_core::ErrorCode::InvalidArgument, "interface_name is empty"});
+    }
+
+    ec_master_t* master = ecrt_request_master(0);
+    if (!master) {
+        return motion_core::Result<motion_core::HalBusConfigEthercat>::failure(
+            {motion_core::ErrorCode::TransportFailure, "Failed to request EtherCAT master 0 for scanning"});
+    }
+
+    ec_master_info_t master_info{};
+    if (ecrt_master(master, &master_info)) {
+        ecrt_release_master(master);
+        return motion_core::Result<motion_core::HalBusConfigEthercat>::failure(
+            {motion_core::ErrorCode::TransportFailure, "Failed to get master info"});
+    }
+
+    motion_core::HalBusConfigEthercat bus_cfg{};
+    bus_cfg.interface_name = interface_name;
+
+    for (uint16_t i = 0; i < master_info.slave_count; ++i) {
+        ec_slave_info_t slave_info{};
+        if (ecrt_master_get_slave(master, i, &slave_info) != 0) continue;
+        if (slave_info.vendor_id != kSupportedVendorId ||
+            slave_info.product_code != kSupportedProductCode) {
+            continue;
+        }
+
+        uint16_t axis_id = i + 1; // Basic sequential ID mapping
+        motion_core::HalAxisRuntimeEntry entry{};
+        entry.axis_id = motion_core::AxisId{axis_id};
+        entry.axis_name.value = "ECAT " + std::to_string(axis_id);
+        entry.transport = motion_core::AxisTransportKind::Ethercat;
+        entry.bus_ref = interface_name;
+        entry.transport_address = axis_id;
+        entry.enable_on_start = false;
+        // The frontend loop will merge these discovered axes into a HalRuntimeConfig
+
+        bus_cfg.axes.push_back(std::move(entry));
+    }
+
+    ecrt_release_master(master);
+    return motion_core::Result<motion_core::HalBusConfigEthercat>::success(std::move(bus_cfg));
+}
+
 motion_core::Result<SlaveBusInfo> EthercatBusManager::get_slave_bus_info(const std::uint16_t axis_id) const {
     std::lock_guard<std::mutex> lock(state_mutex_);
     const auto it = axis_map_.find(axis_id);
@@ -122,9 +170,9 @@ motion_core::Result<SlaveBusInfo> EthercatBusManager::get_slave_bus_info(const s
     return motion_core::Result<SlaveBusInfo>::success(it->second);
 }
 
-EthercatBusManager::BusStatistics EthercatBusManager::get_bus_statistics() const {
+motion_core::Result<motion_core::BusStatistics> EthercatBusManager::get_statistics() const {
     std::lock_guard<std::mutex> lock(stats_mutex_);
-    return current_stats_;
+    return motion_core::Result<motion_core::BusStatistics>::success(current_stats_);
 }
 
 void EthercatBusManager::register_adapter(const int axis_index, EthercatAxisAdapter* adapter) {
@@ -135,7 +183,7 @@ void EthercatBusManager::register_adapter(const int axis_index, EthercatAxisAdap
     registered_adapters_[axis_index] = adapter;
 }
 
-motion_core::Result<void> EthercatBusManager::start_runtime() {
+motion_core::Result<void> EthercatBusManager::start() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (started_) {
         return motion_core::Result<void>::success();
@@ -170,7 +218,7 @@ motion_core::Result<void> EthercatBusManager::start_runtime() {
     return motion_core::Result<void>::success();
 }
 
-motion_core::Result<void> EthercatBusManager::stop_runtime() {
+motion_core::Result<void> EthercatBusManager::stop() {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (!started_) return motion_core::Result<void>::success();
@@ -186,6 +234,13 @@ void EthercatBusManager::poll_cycle() {
 
     auto cycle_start = std::chrono::steady_clock::now();
 
+    // Calculate dt_s for speed calculation
+    double dt_s = 0.0;
+    if (cycles_since_last_stats_ > 0) { // skip first cycle dt calculation
+        dt_s = std::chrono::duration_cast<std::chrono::nanoseconds>(cycle_start - last_cycle_time_).count() * 1e-9;
+    }
+    last_cycle_time_ = cycle_start;
+
     if (auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(cycle_start - last_stats_time_).count(); elapsed >= 1000) {
         std::lock_guard<std::mutex> stat_lock(stats_mutex_);
         current_stats_.cycle_rate_hz = static_cast<double>(cycles_since_last_stats_) * 1000.0 / static_cast<double>(elapsed);
@@ -200,10 +255,19 @@ void EthercatBusManager::poll_cycle() {
     ecrt_master_receive(master_);
     ecrt_domain_process(domain_);
 
-    for (auto* adapter : registered_adapters_) {
-        if (adapter) {
-            adapter->process_cycle(domain_pd_);
+    // Safe copy of adapters array for process cycle to avoid any locks in fast path
+    std::vector<EthercatAxisAdapter*> adapters_to_process;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        for (auto* adapter : registered_adapters_) {
+            if (adapter) {
+                adapters_to_process.push_back(adapter);
+            }
         }
+    }
+
+    for (auto* adapter : adapters_to_process) {
+        adapter->process_cycle(domain_pd_, dt_s);
     }
 
     ecrt_domain_queue(domain_);
