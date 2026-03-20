@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mks/port/can_port_interface.h"
+#include "mks/internal/port/can_port_interface.h"
 
 #include <memory>
 #include <vector>

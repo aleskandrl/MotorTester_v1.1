@@ -31,7 +31,7 @@ Result<void> RuntimeLoop::start(std::chrono::milliseconds period, TickHandler on
     }
 
     bool expected = false;
-    if (!running_.compare_exchange_strong(expected, true)) {
+    if (!running_.compare_exchange_strong(expected, true, std::memory_order_release, std::memory_order_relaxed)) {
         return Result<void>::failure({ErrorCode::Busy, "runtime loop already running"});
     }
 
@@ -41,7 +41,8 @@ Result<void> RuntimeLoop::start(std::chrono::milliseconds period, TickHandler on
 }
 
 Result<void> RuntimeLoop::stop() {
-    if (!running_.exchange(false)) {
+    bool expected = true;
+    if (!running_.compare_exchange_strong(expected, false, std::memory_order_release, std::memory_order_relaxed)) {
         return Result<void>::success();
     }
 
@@ -56,7 +57,7 @@ void RuntimeLoop::worker(std::chrono::milliseconds period, TickHandler on_tick) 
 
     auto next_tick = std::chrono::steady_clock::now() + period;
 
-    while (running_.load()) {
+    while (running_.load(std::memory_order_acquire)) {
         on_tick();
         
         auto now = std::chrono::steady_clock::now();

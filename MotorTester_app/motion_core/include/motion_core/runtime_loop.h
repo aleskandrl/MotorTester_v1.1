@@ -23,7 +23,7 @@ public:
     Result<void> start(std::chrono::milliseconds period, TickHandler on_tick);
     Result<void> stop();
 
-    [[nodiscard]] bool is_running() const noexcept { return running_.load(); }
+    [[nodiscard]] bool is_running() const noexcept { return running_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t get_overrun_count() const noexcept { return overrun_count_.load(std::memory_order_relaxed); }
 
 private:

@@ -136,7 +136,7 @@ private:
     std::atomic<int> current_accel_{50};
     
     std::atomic<double> desired_target_deg_{0.0};
-    double commanded_target_deg_{0.0};
+    std::atomic<double> commanded_target_deg_{0.0};
     std::atomic<double> sine_center_deg_{0.0};
     double sine_phase_accum_rad_{0.0};
     double displayed_actual_deg_{0.0};

@@ -44,10 +44,12 @@ private:
     QPushButton* btn_open_{nullptr};
     QPushButton* btn_close_{nullptr};
     QPushButton* btn_load_hal_{nullptr};
+    QPushButton* btn_save_hal_{nullptr};
     
     // EtherCAT Controls
     QLineEdit* ethercat_iface_edit_{nullptr};
     QPushButton* btn_ecat_open_{nullptr};
+    QPushButton* btn_ecat_close_{nullptr};
     QPushButton* btn_ecat_scan_{nullptr};
     QCheckBox* chk_ecat_auto_connect_{nullptr};
     QPushButton* btn_ecat_start_runtime_{nullptr};
@@ -58,8 +60,10 @@ private:
     QMdiArea* mdi_area_{nullptr};
     QDockWidget* dock_log_{nullptr};
     QLabel* status_stats_label_{nullptr};
-    QLabel* bus_load_value_label_{nullptr};
-    QLabel* bus_rate_value_label_{nullptr};
+    QLabel* mks_bus_load_label_{nullptr};
+    QLabel* mks_bus_rate_label_{nullptr};
+    QLabel* ecat_bus_load_label_{nullptr};
+    QLabel* ecat_bus_rate_label_{nullptr};
 
     QThread* manager_thread_{nullptr};
     mks::AxisManager* manager_{nullptr};

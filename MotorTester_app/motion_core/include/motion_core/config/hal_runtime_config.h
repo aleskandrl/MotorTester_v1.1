@@ -17,13 +17,6 @@ struct HalBusConfigMks {
 };
 
 /**
- * @brief Конфигурация шины EtherCAT (Bootstrap).
- */
-struct HalBusConfigEthercat {
-    std::string interface_name;
-};
-
-/**
  * @brief Описание привязки оси в рантайме (Topology entry).
  */
 struct HalAxisRuntimeEntry {
@@ -34,6 +27,14 @@ struct HalAxisRuntimeEntry {
     uint16_t transport_address{0}; // CAN ID или EtherCAT Position
     std::string config_file;       // Путь к AxisConfig файлу
     bool enable_on_start{false};
+};
+
+/**
+ * @brief Конфигурация шины EtherCAT (Bootstrap).
+ */
+struct HalBusConfigEthercat {
+    std::string interface_name{};
+    std::vector<HalAxisRuntimeEntry> axes{};
 };
 
 /**

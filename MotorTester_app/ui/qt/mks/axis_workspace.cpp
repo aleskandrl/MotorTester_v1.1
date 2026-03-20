@@ -26,6 +26,7 @@
 #include <QSplitter>
 #include <QTextEdit>
 #include <QFileDialog>
+#include <QScrollArea>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -126,10 +127,13 @@ QString protocolDetailsForParameter(const int domain, const int value) {
             return QStringLiteral(
                 "<b>Command:</b> 0x82 SetWorkMode<br>"
                 "<b>Values:</b><br>"
-                "1 = CR_CLOSE / SR_CLOSE (Замкнутый контур, 1500 RPM)<br>"
-                "2 = CR_vFOC / SR_vFOC (Векторное управление, 3000 RPM)<br>"
-                "0 = CR_OPEN / SR_OPEN (Без энкодера, 400 RPM)<br>"
-                "<b>Note:</b> Требуется SR_* для управления по шине CAN.");
+                "0 = Pulse Open (CR_OPEN)<br>"
+                "1 = Pulse Close (CR_CLOSE)<br>"
+                "2 = Pulse vFOC (CR_vFOC)<br>"
+                "3 = Serial Open (SR_OPEN)<br>"
+                "4 = Serial Close (SR_CLOSE)<br>"
+                "5 = Serial vFOC (SR_vFOC)<br>"
+                "<b>Note:</b> Для CAN-команд движения требуются режимы 3/4/5 (Serial).");
         case MksParameter::WorkingCurrentMilliAmp:
             return QStringLiteral(
                 "<b>Command:</b> 0x83 SetWorkingCurrent<br>"
@@ -138,7 +142,7 @@ QString protocolDetailsForParameter(const int domain, const int value) {
         case MksParameter::Subdivision:
             return QStringLiteral(
                 "<b>Command:</b> 0x84 SetSubdivision<br>"
-                "<b>Range:</b> 1..255.<br>"
+                "<b>Range:</b> 0..255 (документированный байтовый диапазон; 256 микрошагов представляются значением 0x00).<br>"
                 "<b>Note:</b> Микрошаг. Чем больше значение, тем выше разрешение.");
         case MksParameter::EnPinActiveLevel:
             return QStringLiteral(
@@ -147,7 +151,8 @@ QString protocolDetailsForParameter(const int domain, const int value) {
         case MksParameter::MotorDirection:
             return QStringLiteral(
                 "<b>Command:</b> 0x86 SetMotorDirection<br>"
-                "<b>Values:</b> 0=Normal, 1=Reverse.");
+                "<b>Values:</b> 0=CW, 1=CCW.<br>"
+                "<b>Note:</b> По документации влияет только на pulse mode (Step/Dir).");
         case MksParameter::AutoScreenOff:
             return QStringLiteral(
                 "<b>Command:</b> 0x87 SetAutoTurnOffScreen<br>"
@@ -167,24 +172,28 @@ QString protocolDetailsForParameter(const int domain, const int value) {
                 "<b>Values:</b> 0=125k, 1=250k, 2=500k, 3=1M.");
         case MksParameter::CanId:
             return QStringLiteral(
-                "<b>Command:</b> 0x8B SetCanId (read-only here)<br>"
-                "<b>Range:</b> 1..2047.<br>"
-                "<b>Note:</b> Меняется только через Provisioning.");
+                "<b>Command:</b> 0x8B SetCanId<br>"
+                "<b>Range:</b> 1..2047 (0x7FF).<br>"
+                "<b>Note:</b> Значение 0 (broadcast) не используется как персональный адрес.<br>"
+                "<b>Operational note:</b> После смены CAN ID ось станет доступна только по новому адресу.");
         case MksParameter::SlaveRespondMode:
             return QStringLiteral(
                 "<b>Command:</b> 0x8C SetSlaveRespondActive (Respond flag)<br>"
+                "<b>Policy:</b> LOCKED (read-only).<br>"
                 "<b>Safe value:</b> 1 (Обязательно для работы HexaKinetica).<br>"
-                "<b>Note:</b> Флаг разрешения ответов мотора на команды.");
+                "<b>Note:</b> Изменение запрещено политикой системы.");
         case MksParameter::SlaveActiveReport:
             return QStringLiteral(
                 "<b>Command:</b> 0x8C SetSlaveRespondActive (Active flag)<br>"
+                "<b>Policy:</b> LOCKED (read-only).<br>"
                 "<b>Values:</b><br>"
                 "0 = Пассивный ответ (только подтверждение приема)<br>"
-                "1 = Активный ответ (подтверждение + уведомление о завершении движения).");
+                "1 = Активный ответ (подтверждение + уведомление о завершении движения).<br>"
+                "<b>Note:</b> Изменение запрещено политикой системы.");
         case MksParameter::GroupId:
             return QStringLiteral(
                 "<b>Command:</b> 0x8D SetGroupId<br>"
-                "<b>Range:</b> 1..2047.<br>"
+                "<b>Range:</b> 1..2047 (0x7FF).<br>"
                 "<b>Use:</b> Group addressing on CAN bus.");
         case MksParameter::KeyLock:
             return QStringLiteral(
@@ -193,7 +202,7 @@ QString protocolDetailsForParameter(const int domain, const int value) {
         case MksParameter::HoldingCurrentIndex:
             return QStringLiteral(
                 "<b>Command:</b> 0x9B SetHoldingCurrent<br>"
-                "<b>Range:</b> 0..8 (от 10% до 90% рабочего тока).");
+                "<b>Range:</b> 1..8 (от 10% до 90% рабочего тока).");
         case MksParameter::LimitPortRemap:
             return QStringLiteral(
                 "<b>Command:</b> 0x9E SetLimitPortRemap<br>"
@@ -295,13 +304,21 @@ void AxisWorkspace::setupUi() {
 }
 
 void AxisWorkspace::setupControlTab() {
-    auto* tab = new QWidget(this);
-    auto* layout = new QVBoxLayout(tab);
+    auto* tab_root = new QWidget(this);
+    auto* root_layout = new QVBoxLayout(tab_root);
+    root_layout->setContentsMargins(0, 0, 0, 0);
+
+    auto* scroll = new QScrollArea(tab_root);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+
+    auto* scroll_content = new QWidget(scroll);
+    auto* layout = new QVBoxLayout(scroll_content);
 
     auto* filter = new WheelEventFilter(this);
 
     // Top actions row (requested: controls on top)
-    auto* actions_box = new QGroupBox("Actions", tab);
+    auto* actions_box = new QGroupBox("Actions", scroll_content);
     auto* actions_layout = new QHBoxLayout(actions_box);
 
     auto* btn_enable = new QPushButton("ENABLE", actions_box);
@@ -330,7 +347,7 @@ void AxisWorkspace::setupControlTab() {
     // Middle split: Basic Motion (left) + Telemetry one-column (right)
     auto* top_row = new QHBoxLayout();
 
-    auto* motion_grp = new QGroupBox("Basic Motion", tab);
+    auto* motion_grp = new QGroupBox("Basic Motion", scroll_content);
     auto* motion_form = new QFormLayout(motion_grp);
 
     mode_combo_ = new QComboBox(motion_grp);
@@ -369,9 +386,9 @@ void AxisWorkspace::setupControlTab() {
     motion_form->addRow("Target Position:", target_pos_spin_);
 
     target_slider_ = new QSlider(Qt::Horizontal, motion_grp);
-    target_slider_->setRange(-100000000, 100000000); // [-1e6; 1e6] deg with x100 scale
-    target_slider_->setSingleStep(10);
-    target_slider_->setPageStep(1000);
+    target_slider_->setRange(-360000, 360000); // ±3600° (10 full turns) at x100 scale
+    target_slider_->setSingleStep(1);          // 0.01° per step
+    target_slider_->setPageStep(100);          // 1° per page
     motion_form->addRow("Live Target:", target_slider_);
 
     auto* type_row = new QWidget(motion_grp);
@@ -425,7 +442,7 @@ void AxisWorkspace::setupControlTab() {
 
     top_row->addWidget(motion_grp, 3);
 
-    auto* status = new QGroupBox("Telemetry (Live)", tab);
+    auto* status = new QGroupBox("Telemetry (Live)", scroll_content);
     auto* status_form = new QFormLayout(status);
     lbl_sys_state_ = new QLabel("N/A", status);
     lbl_state_ = new QLabel("N/A", status);
@@ -446,7 +463,7 @@ void AxisWorkspace::setupControlTab() {
     top_row->addWidget(status, 2);
     layout->addLayout(top_row, 1);
 
-    auto* scope_group = new QGroupBox("Real-time Monitor", tab);
+    auto* scope_group = new QGroupBox("Real-time Monitor", scroll_content);
     auto* scope_layout = new QVBoxLayout(scope_group);
 
     auto* scope_ctrl = new QHBoxLayout();
@@ -582,7 +599,7 @@ void AxisWorkspace::setupControlTab() {
         target_pos_spin_->setValue(v);
         target_pos_spin_->blockSignals(false);
         desired_target_deg_.store(v, std::memory_order_relaxed);
-        commanded_target_deg_ = v;
+        commanded_target_deg_.store(v, std::memory_order_relaxed);
         manual_target_hold_until_ms_ = QDateTime::currentMSecsSinceEpoch() + 1200;
         QMetaObject::invokeMethod(manager_, "moveAbsoluteAxis", Qt::QueuedConnection,
                                   Q_ARG(int, axis_id_),
@@ -594,7 +611,7 @@ void AxisWorkspace::setupControlTab() {
     connect(target_pos_spin_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         if (target_pos_spin_) {
             desired_target_deg_.store(v, std::memory_order_relaxed);
-            commanded_target_deg_ = v;
+            commanded_target_deg_.store(v, std::memory_order_relaxed);
             manual_target_hold_until_ms_ = QDateTime::currentMSecsSinceEpoch() + 1500;
             if (target_slider_) {
                 target_slider_->blockSignals(true);
@@ -627,21 +644,31 @@ void AxisWorkspace::setupControlTab() {
     connect(speed_spin_, qOverload<int>(&QSpinBox::valueChanged), this, [this](int v){ current_speed_.store(v, std::memory_order_relaxed); });
     connect(accel_spin_, qOverload<int>(&QSpinBox::valueChanged), this, [this](int v){ current_accel_.store(v, std::memory_order_relaxed); });
 
-    tabs_->addTab(tab, "Control");
+    scroll->setWidget(scroll_content);
+    root_layout->addWidget(scroll);
+    tabs_->addTab(tab_root, "Control");
 }
 
 void AxisWorkspace::setupConfigTab() {
-    auto* tab = new QWidget(this);
-    auto* layout = new QVBoxLayout(tab);
+    auto* tab_root = new QWidget(this);
+    auto* root_layout = new QVBoxLayout(tab_root);
+    root_layout->setContentsMargins(0, 0, 0, 0);
+
+    auto* scroll = new QScrollArea(tab_root);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+
+    auto* scroll_content = new QWidget(scroll);
+    auto* layout = new QVBoxLayout(scroll_content);
 
     auto* btn_row = new QHBoxLayout();
-    auto* btn_refresh_list = new QPushButton("Refresh List", tab);
-    auto* btn_read = new QPushButton("Read Values", tab);
-    auto* btn_apply = new QPushButton("Apply Changes", tab);
-    auto* btn_export_full = new QPushButton("Export Config (AxisConfig)", tab);
-    auto* btn_import_full = new QPushButton("Import Config (AxisConfig)", tab);
-    auto* btn_save = new QPushButton("Save Current to JSON...", tab);
-    auto* btn_load = new QPushButton("Load JSON...", tab);
+    auto* btn_refresh_list = new QPushButton("Refresh List", scroll_content);
+    auto* btn_read = new QPushButton("Read Values", scroll_content);
+    auto* btn_apply = new QPushButton("Apply Changes", scroll_content);
+    auto* btn_export_full = new QPushButton("Export Config (AxisConfig)", scroll_content);
+    auto* btn_import_full = new QPushButton("Import Config (AxisConfig)", scroll_content);
+    auto* btn_save = new QPushButton("Save Current to JSON...", scroll_content);
+    auto* btn_load = new QPushButton("Load JSON...", scroll_content);
     btn_row->addWidget(btn_refresh_list);
     btn_row->addWidget(btn_read);
     btn_row->addWidget(btn_apply);
@@ -652,7 +679,7 @@ void AxisWorkspace::setupConfigTab() {
     btn_row->addWidget(btn_load);
     layout->addLayout(btn_row);
 
-    auto* split = new QSplitter(Qt::Horizontal, tab);
+    auto* split = new QSplitter(Qt::Horizontal, scroll_content);
     
     config_tree_ = new QTreeWidget(split);
     config_tree_->setColumnCount(6);
@@ -704,6 +731,10 @@ void AxisWorkspace::setupConfigTab() {
             if (has_max) desc += "- Max: " + max_val + "<br>";
         }
 
+        const bool persistable = current->data(kNameColumn, Qt::UserRole + 1).toBool();
+        desc += QString("<br><b>Persistable (AxisConfig):</b> %1<br>")
+                    .arg(persistable ? "Yes" : "No");
+
         const QString protocol_details = protocolDetailsForParameter(domain, value_id);
         if (!protocol_details.isEmpty()) {
             desc += "<br><b>Protocol details:</b><br>" + protocol_details;
@@ -720,7 +751,9 @@ void AxisWorkspace::setupConfigTab() {
     connect(btn_save, &QPushButton::clicked, this, &AxisWorkspace::saveParametersToFile);
     connect(btn_load, &QPushButton::clicked, this, &AxisWorkspace::loadParametersFromFile);
 
-    tabs_->addTab(tab, "Configuration");
+    scroll->setWidget(scroll_content);
+    root_layout->addWidget(scroll);
+    tabs_->addTab(tab_root, "Configuration");
 }
 
 void AxisWorkspace::setupCommandsTab() {
@@ -746,10 +779,13 @@ void AxisWorkspace::setupCommandsTab() {
 
     txt_cmd_log_ = new QTextEdit(tab);
     txt_cmd_log_->setReadOnly(true);
-    txt_cmd_log_->append("Raw command panel. Enter bytes in hex.");
+    txt_cmd_log_->append("Raw command panel is disabled in unified runtime path.");
+    txt_cmd_log_->append("Use typed APIs/parameter tree instead (safety-policy enforced).");
     layout->addWidget(txt_cmd_log_, 1);
 
     connect(btn_clear, &QPushButton::clicked, txt_cmd_log_, &QTextEdit::clear);
+    btn_send->setEnabled(false);
+    btn_send->setToolTip("Raw commands are deprecated/unsupported in unified runtime.");
     connect(btn_send, &QPushButton::clicked, this, [this]() {
         bool byte_ok = false;
         const int cmd_byte = txt_cmd_byte_->text().toInt(&byte_ok, 16);
@@ -813,6 +849,7 @@ void AxisWorkspace::onParameterListReady(int axis_id, const QVariantList& p_list
         item->setData(kReadOnlyColumn, Qt::UserRole, map["has_max"]);
         item->setData(kCurrentValueColumn, Qt::UserRole, map["min_value"]);
         item->setData(kNewValueColumn, Qt::UserRole, map["max_value"]);
+        item->setData(kNameColumn, Qt::UserRole + 1, map.value("persistable", true));
         
         if (!map["read_only"].toBool()) {
             item->setFlags(item->flags() | Qt::ItemIsEditable);
@@ -879,6 +916,8 @@ void AxisWorkspace::applyParametersPatch() {
 
     QVariantList patch;
     QStringList validation_errors;
+    bool can_id_change_requested = false;
+    QStringList can_id_targets;
 
     for (int i = 0; i < config_tree_->topLevelItemCount(); ++i) {
         auto* item = config_tree_->topLevelItem(i);
@@ -969,6 +1008,14 @@ void AxisWorkspace::applyParametersPatch() {
         map["value"] = item->data(kGroupColumn, Qt::UserRole);
         map["data"] = parsed_value;
 
+        const int domain_value = map["domain"].toInt();
+        const int parameter_value = map["value"].toInt();
+        if (domain_value == static_cast<int>(motion_core::ParameterDomain::Mks) &&
+            parameter_value == static_cast<int>(motion_core::MksParameter::CanId)) {
+            can_id_change_requested = true;
+            can_id_targets.push_back(parsed_value.toString());
+        }
+
         patch.push_back(map);
         item->setText(kNewValueColumn, "");
     }
@@ -981,11 +1028,33 @@ void AxisWorkspace::applyParametersPatch() {
     }
 
     if (!patch.isEmpty()) {
+        if (can_id_change_requested) {
+            const auto answer = QMessageBox::warning(
+                this,
+                "CAN ID change",
+                QString("Applying CAN ID change (%1) will switch the drive address immediately.\n"
+                        "After apply, this workspace may stop receiving telemetry until re-scan/reconnect.\n\n"
+                        "Continue?")
+                    .arg(can_id_targets.join(", ")),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No);
+            if (answer != QMessageBox::Yes) {
+                return;
+            }
+        }
+
         auto* manager = manager_.data();
         QMetaObject::invokeMethod(manager, [manager, id = axis_id_, p = patch]() {
             manager->applyParameterPatch(id, p);
         }, Qt::QueuedConnection);
         QTimer::singleShot(120, this, [this]() { readParametersFromDrive(); });
+
+        if (can_id_change_requested) {
+            QMessageBox::information(
+                this,
+                "CAN ID changed",
+                "CAN ID write requested. If telemetry freezes, perform Scan/Connect using the new CAN ID.");
+        }
     }
 }
 
@@ -1073,7 +1142,7 @@ void AxisWorkspace::onSineToggled(bool enabled) {
             std::swap(trajectory_queue_, empty);
         }
         
-        sine_center_deg_.store(commanded_target_deg_, std::memory_order_relaxed);
+        sine_center_deg_.store(commanded_target_deg_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         sine_phase_accum_rad_ = 0.0;
         
         QFile::remove("sine_dump.csv");
@@ -1081,7 +1150,7 @@ void AxisWorkspace::onSineToggled(bool enabled) {
     }
 
     if (!enabled) {
-        desired_target_deg_.store(commanded_target_deg_, std::memory_order_relaxed);
+        desired_target_deg_.store(commanded_target_deg_.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
 }
 
@@ -1179,8 +1248,8 @@ void AxisWorkspace::trajectoryLoop() {
             desired_target_deg_.store(ui_target, std::memory_order_relaxed);
         }
         
-        commanded_target_deg_ = desired_target_deg_.load(std::memory_order_relaxed);
-        double cmd_tgt = commanded_target_deg_;
+        commanded_target_deg_.store(desired_target_deg_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        double cmd_tgt = commanded_target_deg_.load(std::memory_order_relaxed);
         
         double t_sec = 0.0;
         if (telemetry_t0_ms_ > 0) {
@@ -1221,7 +1290,7 @@ void AxisWorkspace::setTargetPosition(double pos_deg) {
     if (target_pos_spin_) {
         manual_target_hold_until_ms_ = QDateTime::currentMSecsSinceEpoch() + 800;
         desired_target_deg_.store(pos_deg, std::memory_order_relaxed);
-        commanded_target_deg_ = pos_deg;
+        commanded_target_deg_.store(pos_deg, std::memory_order_relaxed);
         target_pos_spin_->setValue(pos_deg);
     }
     if (target_slider_) {
@@ -1241,7 +1310,7 @@ void AxisWorkspace::triggerAbsoluteMove() {
 
     const double manual_target = target_pos_spin_ ? target_pos_spin_->value() : 0.0;
     desired_target_deg_.store(manual_target, std::memory_order_relaxed);
-    commanded_target_deg_ = manual_target;
+    commanded_target_deg_.store(manual_target, std::memory_order_relaxed);
     manual_target_hold_until_ms_ = QDateTime::currentMSecsSinceEpoch() + 1200;
     
     if (radio_move_rel_ && radio_move_rel_->isChecked()) {
@@ -1329,7 +1398,7 @@ void AxisWorkspace::onTelemetryUpdated(int axis_id, const QVariantMap& telemetry
             target_pos_spin_->setValue(axis_val);
             target_pos_spin_->blockSignals(false);
             desired_target_deg_.store(axis_val, std::memory_order_relaxed);
-            commanded_target_deg_ = axis_val;
+            commanded_target_deg_.store(axis_val, std::memory_order_relaxed);
         }
     }
     if (telemetry.contains("target")) {
@@ -1363,3 +1432,47 @@ void AxisWorkspace::onTelemetryUpdated(int axis_id, const QVariantMap& telemetry
 }
 
 // Removed config readback slot
+
+void AxisWorkspace::exportAxisConfig() {
+    if (!manager_) return;
+
+    const QString path = QFileDialog::getSaveFileName(
+        this,
+        "Export AxisConfig",
+        QString("axis_%1.axis_config.json").arg(axis_id_),
+        "JSON Files (*.json)");
+    if (path.isEmpty()) {
+        return;
+    }
+
+    auto* manager = manager_.data();
+    QMetaObject::invokeMethod(
+        manager,
+        [manager, axis_id = axis_id_, path]() {
+            manager->exportAxisConfig(axis_id, path);
+        },
+        Qt::QueuedConnection);
+}
+
+void AxisWorkspace::importAxisConfig() {
+    if (!manager_) return;
+
+    const QString path = QFileDialog::getOpenFileName(
+        this,
+        "Import AxisConfig",
+        QString(),
+        "JSON Files (*.json)");
+    if (path.isEmpty()) {
+        return;
+    }
+
+    auto* manager = manager_.data();
+    QMetaObject::invokeMethod(
+        manager,
+        [manager, axis_id = axis_id_, path]() {
+            manager->importAxisConfig(axis_id, path);
+        },
+        Qt::QueuedConnection);
+
+    QTimer::singleShot(120, this, [this]() { readParametersFromDrive(); });
+}

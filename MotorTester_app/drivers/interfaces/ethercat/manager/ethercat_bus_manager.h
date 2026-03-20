@@ -2,6 +2,7 @@
 
 #include "motion_core/result.h"
 #include "motion_core/runtime_loop.h"
+#include "motion_core/bus_manager_interface.h"
 
 #include <chrono>
 #include <cstdint>
@@ -11,6 +12,8 @@
 #include <vector>
 #include <mutex>
 #include <atomic>
+
+#include "motion_core/config/hal_runtime_config.h"
 
 #include <ecrt.h>
 
@@ -28,10 +31,12 @@ struct EthercatBusConfig {
     std::chrono::milliseconds cycle_time{4}; // 250 Hz default
 };
 
-class EthercatBusManager {
+class EthercatBusManager : public motion_core::IBusManager {
 public:
     explicit EthercatBusManager(EthercatBusConfig config);
     ~EthercatBusManager();
+
+    [[nodiscard]] std::string get_name() const override { return "EtherCAT " + config_.interface_name; }
 
     motion_core::Result<void> open();
     motion_core::Result<void> close();
@@ -40,14 +45,10 @@ public:
 
     [[nodiscard]] motion_core::Result<std::vector<std::uint16_t>> scan_axes();
 
-    struct BusStatistics {
-        double cycle_rate_hz{0.0};
-        double bus_load_percent{0.0};
-    };
-    [[nodiscard]] BusStatistics get_bus_statistics() const;
+    [[nodiscard]] motion_core::Result<motion_core::BusStatistics> get_statistics() const override;
 
-    motion_core::Result<void> start_runtime();
-    motion_core::Result<void> stop_runtime();
+    motion_core::Result<void> start() override;
+    motion_core::Result<void> stop() override;
 
     [[nodiscard]] motion_core::Result<SlaveBusInfo> get_slave_bus_info(std::uint16_t axis_id) const;
 
@@ -55,6 +56,10 @@ public:
     [[nodiscard]] ec_domain_t* domain() const { return domain_; }
 
     void register_adapter(int axis_index, EthercatAxisAdapter* adapter);
+
+    // Headless discovery that does not hold the master open
+    static motion_core::Result<motion_core::HalBusConfigEthercat> discover_ethercat_topology(
+        const std::string& interface_name);
 
 private:
     void poll_cycle();
@@ -81,11 +86,12 @@ private:
     
     std::vector<EthercatAxisAdapter*> registered_adapters_{};
 
-    BusStatistics current_stats_{};
+    motion_core::BusStatistics current_stats_{};
     mutable std::mutex stats_mutex_;
     std::chrono::steady_clock::time_point last_stats_time_{};
     uint64_t cycles_since_last_stats_{0};
     uint64_t accrued_cycle_time_us_{0};
+    std::chrono::steady_clock::time_point last_cycle_time_{};
 };
 
 [[nodiscard]] std::shared_ptr<EthercatBusManager> make_ethercat_bus_manager(EthercatBusConfig config);

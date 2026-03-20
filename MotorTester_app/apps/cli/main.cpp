@@ -1,16 +1,15 @@
-#include "mks/adapter/mks_axis_adapter.h"
-#include "mks/adapter/mks_runtime_config.h"
 #include "mks/adapter/mks_runtime_factory.h"
-#include "mks/manager/mks_can_bus_manager.h"
-#include "mks/port/gs_usb_can_port.h"
-#include "motion_core/axis_control_service.h"
+#include "mks/internal/port/gs_usb_can_port.h"
+#include "ethercat/manager/ethercat_runtime_factory.h"
+#include "motion_core/hal_runtime.h"
+#include "motion_core/runtime_factory_registry.h"
+#include "motion_core/config/hal_runtime_config_json.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -23,12 +22,21 @@ void printUsage() {
                  "  mks_can_cli --runtime-config <path.json> --control-status [--id <axis_id>]\n"
                  "  mks_can_cli --device usb:BUS:ADDR --id <can_id> --control-status\n"
                  "\n"
-                 "Note: Only control logic via AxisControlService is supported.\n";
+                 "Note: direct IAxis + BusManager runtime path is used.\n";
 }
 
 } // namespace
 
 int main(int argc, char* argv[]) {
+    motion_core::RuntimeFactoryRegistry::register_factory(
+        motion_core::AxisTransportKind::CanBus,
+        [](const motion_core::HalRuntimeConfig& cfg) { return mks::build_mks_runtime(cfg); }
+    );
+    motion_core::RuntimeFactoryRegistry::register_factory(
+        motion_core::AxisTransportKind::Ethercat,
+        [](const motion_core::HalRuntimeConfig& cfg) { return ethercat_driver::build_ethercat_runtime(cfg); }
+    );
+
     if (argc < 2) {
         printUsage();
         return 0;
@@ -87,51 +95,41 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
-    motion_core::AxisControlService control_service;
-    std::vector<std::shared_ptr<mks::MksCanBusManager>> bus_managers;
+    motion_core::HalRuntime runtime{};
 
     if (!runtime_config_path.empty()) {
-        const auto config_result = mks::load_mks_runtime_config_from_file(runtime_config_path);
+        const auto config_result = motion_core::load_hal_runtime_config_from_file(runtime_config_path);
         if (!config_result.ok()) {
             std::cerr << "Runtime config load failed: " << config_result.error().message << "\n";
             return 12;
         }
 
-        const auto runtime_result = mks::build_mks_runtime(config_result.value());
+        const auto runtime_result = runtime.open_from_config(config_result.value());
         if (!runtime_result.ok()) {
-            std::cerr << "Runtime build failed: " << runtime_result.error().message << "\n";
+            std::cerr << "Runtime open failed: " << runtime_result.error().message << "\n";
             return 13;
         }
-
-        bus_managers = runtime_result.value().bus_managers;
-        for (const auto& axis : runtime_result.value().axes) {
-            const auto register_result = control_service.add_axis(axis);
-            if (!register_result.ok()) {
-                std::cerr << "ControlService register failed: " << register_result.error().message << "\n";
-                return 9;
-            }
-        }
     } else {
-        mks::MksCanBusConfig bus_config{};
-        bus_config.device_path = device_path;
-        bus_config.baud_rate = static_cast<unsigned int>(baud_rate);
-        bus_config.cycle_time = std::chrono::milliseconds(4);
-        auto bus_manager = mks::make_mks_can_bus_manager(std::move(bus_config));
-        bus_managers.push_back(bus_manager);
+        motion_core::HalRuntimeConfig cfg{};
+        motion_core::HalBusConfigMks bus{};
+        bus.interface_id = "cli_mks_bus_0";
+        bus.device_path = device_path;
+        bus.baud_rate = static_cast<std::uint32_t>(baud_rate);
+        cfg.mks_buses.push_back(bus);
 
-        mks::MksAxisAdapterConfig axis_config{};
-        axis_config.axis_id = motion_core::AxisId{static_cast<std::uint16_t>(can_id)};
-        axis_config.axis_name = motion_core::AxisName{"mks_axis_" + std::to_string(can_id)};
-        axis_config.can_id = static_cast<std::uint16_t>(can_id);
-        axis_config.bus_manager = bus_manager;
-        axis_config.auto_start_bus_manager = true;
-        axis_config.axis_units_per_degree = 16384.0 / 360.0;
+        motion_core::HalAxisRuntimeEntry axis{};
+        axis.axis_id = motion_core::AxisId{static_cast<std::uint16_t>(can_id)};
+        axis.axis_name = motion_core::AxisName{"mks_axis_" + std::to_string(can_id)};
+        axis.transport = motion_core::AxisTransportKind::CanBus;
+        axis.bus_ref = bus.interface_id;
+        axis.transport_address = static_cast<std::uint16_t>(can_id);
+        axis.enable_on_start = true;
+        cfg.axes.push_back(axis);
 
-        auto axis = mks::make_mks_axis_adapter(std::move(axis_config));
-        const auto register_result = control_service.add_axis(axis);
-        if (!register_result.ok()) {
-            std::cerr << "ControlService register failed: " << register_result.error().message << "\n";
-            return 9;
+        const auto runtime_result = runtime.open_from_config(cfg);
+        if (!runtime_result.ok()) {
+            std::cerr << "Runtime open failed: " << runtime_result.error().message << "\n";
+            return 14;
         }
     }
 
@@ -139,26 +137,29 @@ int main(int argc, char* argv[]) {
     if (has_explicit_id) {
         target_axes.push_back(motion_core::AxisId{static_cast<std::uint16_t>(can_id)});
     } else {
-        const auto list_result = control_service.list_axes();
-        if (!list_result.ok()) {
-            std::cerr << "ControlService list failed: " << list_result.error().message << "\n";
-            return 14;
+        const auto listed = runtime.list_axes();
+        if (!listed.ok()) {
+            std::cerr << "List axes failed: " << listed.error().message << "\n";
+            return 15;
         }
-        for (const auto& axis_info : list_result.value()) {
-            target_axes.push_back(axis_info.id);
+        for (const auto& info : listed.value()) {
+            target_axes.push_back(info.id);
         }
         std::sort(target_axes.begin(), target_axes.end(), [](const motion_core::AxisId lhs, const motion_core::AxisId rhs) {
             return lhs.value < rhs.value;
         });
     }
 
-    (void)control_service.start_dispatch_loop(std::chrono::milliseconds(4));
+    const auto start_runtime = runtime.start();
+    if (!start_runtime.ok()) {
+        std::cerr << "Runtime start failed: " << start_runtime.error().message << "\n";
+        return 16;
+    }
 
     std::vector<motion_core::AxisId> started_axes;
     for (const auto axis_id : target_axes) {
-        const auto start_result = control_service.start_axis(axis_id);
-        if (!start_result.ok()) {
-            std::cerr << "ControlService start failed for axis " << axis_id.value << ": " << start_result.error().message << "\n";
+        const auto axis_res = runtime.find_axis(axis_id.value);
+        if (!axis_res.ok()) {
             continue;
         }
         started_axes.push_back(axis_id);
@@ -166,9 +167,8 @@ int main(int argc, char* argv[]) {
 
     if (started_axes.empty()) {
         std::cerr << "No axis was started via control service\n";
-        for (const auto& bus_manager : bus_managers) {
-            (void)bus_manager->stop();
-        }
+        (void)runtime.stop();
+        (void)runtime.close();
         return 10;
     }
 
@@ -176,15 +176,19 @@ int main(int argc, char* argv[]) {
 
     for (int i = 0; i < 5; ++i) {
         for (const auto axis_id : started_axes) {
-            const auto telemetry_result = control_service.read_telemetry(axis_id);
+            const auto axis_res = runtime.find_axis(axis_id.value);
+            if (!axis_res.ok()) {
+                continue;
+            }
+            const auto telemetry_result = axis_res.value()->read_telemetry();
             if (!telemetry_result.ok()) {
-                std::cerr << "ControlService telemetry failed for axis " << axis_id.value << ": "
+                std::cerr << "Telemetry failed for axis " << axis_id.value << ": "
                           << telemetry_result.error().message << "\n";
                 continue;
             }
 
             const auto& telemetry = telemetry_result.value();
-            std::cout << "ControlService telemetry axis=" << axis_id.value
+            std::cout << "telemetry axis=" << axis_id.value
                       << " pos_deg=" << telemetry.actual_position_deg
                       << " vel_deg_s=" << telemetry.actual_velocity_deg_per_sec
                       << " status_word=" << telemetry.status_word
@@ -193,11 +197,8 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    for (const auto axis_id : started_axes) {
-        (void)control_service.stop_axis(axis_id);
-    }
-
-    (void)control_service.stop_dispatch_loop();
+    (void)runtime.stop();
+    (void)runtime.close();
 
     return 0;
 }
