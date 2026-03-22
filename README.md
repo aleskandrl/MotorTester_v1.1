@@ -12,7 +12,7 @@
 > 🎥 **Watch on YouTube**: [Demo Video](https://www.youtube.com/watch?v=gU8G4GgxzSM)
 
 
-## ✨ Key Features
+## Key Features
 
 *   **Motor Configuration**: Complete setup and tuning capabilities for HexaArm series robot motors.
 *   **EtherCAT Communication**: High-speed, real-time communication with EtherCAT servo drives, complete with Distributed Clocks (DC) synchronization.
@@ -20,7 +20,7 @@
 *   **Real-time Telemetry and Diagnostics**: Live monitoring of motor states, positions, velocities, and hardware errors through an intuitive UI.
 *   **Parameter Management**: Seamless reading and writing of motor parameters via EtherCAT CoE (CAN application protocol over EtherCAT).
 
-## 🏗 Architecture
+## Architecture
 
 The project is modularly structured to ensure high reliability and easy maintenance:
 
